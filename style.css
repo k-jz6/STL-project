@@ -362,6 +362,11 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .header-day.weekend { background: var(--weekend-bg); }
 .header-day.holiday { background: var(--holiday-bg); }
 .header-day.today { background: var(--today-bg) !important; }
+.btn-secondary.is-active {
+    background: #e0f2fe;
+    border-color: #38bdf8;
+    color: #075985;
+}
 .header-day.today-boundary::before {
     content: "";
     position: absolute;

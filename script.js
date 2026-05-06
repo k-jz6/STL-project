@@ -167,7 +167,8 @@ let appData = {
         startDate: dateToISO(defaultStart),
         endDate: dateToISO(defaultEnd),
         holidays: [],
-        showMainLine: true
+        showMainLine: true,
+        hideHolidays: false
     },
     headers: ["項目1", "項目2", "時間"], 
     todoColumns: DEFAULT_TODO_COLUMNS,
@@ -184,6 +185,7 @@ let appStore = {
 };
 let currentPlanId = null;
 
+let allTimelineDays = [];
 let timelineDays = [];
 let taskObjects = [];
 let activeTaskId = null;
@@ -230,6 +232,7 @@ const showHiddenCheck = document.getElementById("showHiddenCheck");
 const showMainLineCheck = document.getElementById("showMainLineCheck");
 const collapseAllSubsBtn = document.getElementById("collapseAllSubsBtn");
 const expandAllSubsBtn = document.getElementById("expandAllSubsBtn");
+const toggleHolidaysBtn = document.getElementById("toggleHolidaysBtn");
 const projectNameInput = document.getElementById("projectNameInput");
 const planSelect = document.getElementById("planSelect");
 const newPlanBtn = document.getElementById("newPlanBtn");
@@ -291,6 +294,40 @@ function formatTimestamp(d) {
 }
 function dateToIndex(str) { return timelineDays.findIndex((d) => d.iso === str); }
 function centerX(index) { return index * CELL_WIDTH + CELL_WIDTH / 2; }
+function dateToVisibleIndexAtOrAfter(str) {
+    const exact = dateToIndex(str);
+    if (exact !== -1) return exact;
+    return timelineDays.findIndex((d) => d.iso >= str);
+}
+function dateToVisibleIndexAtOrBefore(str) {
+    const exact = dateToIndex(str);
+    if (exact !== -1) return exact;
+    for (let i = timelineDays.length - 1; i >= 0; i--) {
+        if (timelineDays[i].iso <= str) return i;
+    }
+    return -1;
+}
+function getVisibleRangeIndices(startIso, endIso) {
+    const s = startIso <= endIso ? startIso : endIso;
+    const e = startIso <= endIso ? endIso : startIso;
+    const sIdx = dateToVisibleIndexAtOrAfter(s);
+    const eIdx = dateToVisibleIndexAtOrBefore(e);
+    if (sIdx === -1 || eIdx === -1 || sIdx > eIdx) return null;
+    return { sIdx, eIdx };
+}
+function shiftDateByVisibleColumns(str, delta) {
+    if (appData.settings.hideHolidays === true && timelineDays.length > 0) {
+        let idx = dateToIndex(str);
+        if (idx === -1) {
+            idx = delta >= 0 ? dateToVisibleIndexAtOrAfter(str) : dateToVisibleIndexAtOrBefore(str);
+        }
+        if (idx !== -1) {
+            const nextIdx = Math.max(0, Math.min(timelineDays.length - 1, idx + delta));
+            return timelineDays[nextIdx].iso;
+        }
+    }
+    return shiftDateStr(str, delta);
+}
 function getByteLength(str) {
     let len = 0;
     for (let i = 0; i < str.length; i++) {
@@ -341,7 +378,8 @@ function createEmptyPlanData(name = "標準の計画") {
             startDate: dateToISO(defaultStart),
             endDate: dateToISO(defaultEnd),
             holidays: [],
-            showMainLine: true
+            showMainLine: true,
+            hideHolidays: false
         },
         headers: ["項目1", "項目2", "時間"],
         todoColumns: DEFAULT_TODO_COLUMNS,
@@ -425,7 +463,8 @@ function sanitizeImportedPlanData(raw) {
             startDate,
             endDate,
             holidays: sanitizeStringArray(raw?.settings?.holidays, 366, 16),
-            showMainLine: raw?.settings?.showMainLine !== false
+            showMainLine: raw?.settings?.showMainLine !== false,
+            hideHolidays: raw?.settings?.hideHolidays === true
         },
         headers: Array.isArray(raw.headers)
             ? raw.headers.slice(0, 3).map((h, i) => sanitizeString(h, base.headers[i] || "", 40))
@@ -690,9 +729,9 @@ function computeTaskBaseHeight(task) {
     let maxLaneUsed = 0;
     sortedSegs.forEach(seg => {
         let requiredLane = 0;
-        let sIdx = dateToIndex(seg.startDate);
-        let eIdx = dateToIndex(seg.endDate);
-        if (sIdx === -1 || eIdx === -1) return;
+        const visibleRange = getVisibleRangeIndices(seg.startDate, seg.endDate);
+        if (!visibleRange) return;
+        let { sIdx, eIdx } = visibleRange;
         while (true) {
             let overlap = false;
             for (let i = Math.min(sIdx, eIdx); i <= Math.max(sIdx, eIdx); i++) {
@@ -1104,7 +1143,7 @@ function getActiveDailyValueRef() {
 function moveActiveDailyValue(delta) {
     const ref = getActiveDailyValueRef();
     if (!ref) return;
-    const nextIso = shiftDateStr(ref.iso, delta);
+    const nextIso = shiftDateByVisibleColumns(ref.iso, delta);
     if (nextIso < ref.seg.startDate || nextIso > ref.seg.endDate) return;
     if (dateToIndex(nextIso) === -1) return;
     activeDailyValueTarget.iso = nextIso;
@@ -1242,6 +1281,9 @@ function restoreFromData(data) {
     if (typeof appData.settings.showMainLine !== "boolean") {
         appData.settings.showMainLine = true;
     }
+    if (typeof appData.settings.hideHolidays !== "boolean") {
+        appData.settings.hideHolidays = false;
+    }
     if (!appData.headers) appData.headers = ["項目1", "項目2", "時間"];
     if (!appData.columnWidths) appData.columnWidths = [30, 120, 90, 40];
     if (!Array.isArray(appData.dependencies)) appData.dependencies = [];
@@ -1269,6 +1311,7 @@ function restoreFromData(data) {
 
     document.getElementById("todoColumnsInput").value = appData.todoColumns;
     showMainLineCheck.checked = appData.settings.showMainLine !== false;
+    updateHolidayToggleButton();
     applyFreeMemoHeight(appData.memoHeight);
 
     leftRowsContainer.innerHTML = "";
@@ -1294,7 +1337,10 @@ function restoreFromData(data) {
 }
 
 function scrollToToday() {
-    const todayIdx = timelineDays.findIndex(d => d.iso === todayISO);
+    let todayIdx = timelineDays.findIndex(d => d.iso === todayISO);
+    if (todayIdx === -1 && appData.settings.hideHolidays === true) {
+        todayIdx = dateToVisibleIndexAtOrAfter(todayISO);
+    }
     if (todayIdx !== -1) {
         const x = todayIdx * CELL_WIDTH;
         const scrollContainer = document.querySelector(".gantt-scroll-container");
@@ -1305,6 +1351,7 @@ function scrollToToday() {
 }
 
 function buildTimeline() {
+    allTimelineDays = [];
     timelineDays = [];
     const startDt = isoToDate(appData.settings.startDate);
     const endDt = isoToDate(appData.settings.endDate);
@@ -1313,8 +1360,8 @@ function buildTimeline() {
     while (curr <= endDt) {
         const iso = dateToISO(curr);
         const dow = curr.getDay();
-        timelineDays.push({
-            index: timelineDays.length,
+        allTimelineDays.push({
+            index: allTimelineDays.length,
             date: new Date(curr),
             iso,
             day: curr.getDate(),
@@ -1327,6 +1374,15 @@ function buildTimeline() {
         });
         curr.setDate(curr.getDate() + 1);
     }
+    timelineDays = appData.settings.hideHolidays === true
+        ? allTimelineDays.filter((d) => !d.isWeekend && !d.isHoliday)
+        : allTimelineDays.slice();
+    if (timelineDays.length === 0) {
+        timelineDays = allTimelineDays.slice();
+    }
+    timelineDays.forEach((d, index) => {
+        d.index = index;
+    });
     updateRangeLabel();
 }
 
@@ -1361,6 +1417,50 @@ function buildHeader() {
         if (d.isToday) c.classList.add("today");
         c.dataset.iso = d.iso;
         totalRow.appendChild(c);
+    });
+}
+
+function updateHolidayToggleButton() {
+    if (!toggleHolidaysBtn) return;
+    const isHidden = appData.settings.hideHolidays === true;
+    toggleHolidaysBtn.textContent = isHidden ? "休日表示" : "休日非表示";
+    toggleHolidaysBtn.title = isHidden ? "休日列を表示する" : "休日列を閉じて稼働日のみ表示する";
+    toggleHolidaysBtn.setAttribute("aria-pressed", String(isHidden));
+    toggleHolidaysBtn.classList.toggle("is-active", isHidden);
+}
+
+function rebuildTaskRowCells(task) {
+    if (!task?.cellRowEl || !task?.rowEl) return;
+    const total = timelineDays.length;
+    task.rowEl.style.gridTemplateColumns = `repeat(${total}, ${CELL_WIDTH}px)`;
+    task.cellRowEl.innerHTML = "";
+    timelineDays.forEach((d, i) => {
+        const c = document.createElement("div");
+        c.className = "cell";
+        if (d.isWeekend) c.classList.add("weekend");
+        if (d.isHoliday) c.classList.add("holiday");
+        if (d.isToday) c.classList.add("today");
+        c.dataset.index = i;
+        task.cellRowEl.appendChild(c);
+    });
+}
+
+function refreshTimelineDisplay() {
+    buildTimeline();
+    buildHeader();
+    taskObjects.forEach((task) => {
+        task.pendingStartIndex = null;
+        task.pendingStartDate = null;
+        task.pendingStartLane = 0;
+        task.pendingMainStartIndex = null;
+        task.pendingMainStartDate = null;
+        rebuildTaskRowCells(task);
+    });
+    updateHolidayToggleButton();
+    renderAllSegments();
+    requestAnimationFrame(() => {
+        scrollToToday();
+        scheduleProgressGuideRefresh();
     });
 }
 
@@ -1915,9 +2015,9 @@ function renderAllSegments() {
         let maxLaneUsed = 0;
         sortedSegs.forEach(seg => {
             let requiredLane = 0;
-            let sIdx = dateToIndex(seg.startDate);
-            let eIdx = dateToIndex(seg.endDate);
-            if (sIdx === -1 || eIdx === -1) return;
+            const visibleRange = getVisibleRangeIndices(seg.startDate, seg.endDate);
+            if (!visibleRange) return;
+            let { sIdx, eIdx } = visibleRange;
             while (true) {
                 let overlap = false;
                 for (let i = Math.min(sIdx, eIdx); i <= Math.max(sIdx, eIdx); i++) {
@@ -1961,11 +2061,8 @@ function renderAllSegments() {
                 } else {
                     const sdt = isoToDate(seg.startDate), edt = isoToDate(seg.endDate);
                     if (edt >= rangeStart && sdt <= rangeEnd) {
-                        const vs = sdt < rangeStart ? rangeStart : sdt;
-                        const ve = edt > rangeEnd ? rangeEnd : edt;
-                        const sIdx = dateToIndex(dateToISO(vs));
-                        const eIdx = dateToIndex(dateToISO(ve));
-                        if (sIdx !== -1 && eIdx !== -1) drawRangeSegment(task, seg, sIdx, eIdx, topPx);
+                        const visibleRange = getVisibleRangeIndices(seg.startDate, seg.endDate);
+                        if (visibleRange) drawRangeSegment(task, seg, visibleRange.sIdx, visibleRange.eIdx, topPx);
                     }
                 }
             });
@@ -2030,9 +2127,9 @@ function drawMainSchedule(task, main, mainIndex = 0) {
 
     const visibleStart = startDate < rangeStart ? rangeStart : startDate;
     const visibleEnd = endDate > rangeEnd ? rangeEnd : endDate;
-    const sIdx = dateToIndex(dateToISO(visibleStart));
-    const eIdx = dateToIndex(dateToISO(visibleEnd));
-    if (sIdx === -1 || eIdx === -1) return;
+    const visibleRange = getVisibleRangeIndices(dateToISO(visibleStart), dateToISO(visibleEnd));
+    if (!visibleRange) return;
+    const { sIdx, eIdx } = visibleRange;
 
     const sc = centerX(sIdx);
     const ec = centerX(eIdx);
@@ -2076,7 +2173,7 @@ function drawMainSchedule(task, main, mainIndex = 0) {
         const progressDate = isoToDate(main.progressEndDate);
         const progressVisibleEnd = progressDate > visibleEnd ? visibleEnd : progressDate;
         if (progressVisibleEnd >= visibleStart) {
-            const pIdx = dateToIndex(dateToISO(progressVisibleEnd));
+            const pIdx = dateToVisibleIndexAtOrBefore(dateToISO(progressVisibleEnd));
             if (pIdx !== -1) {
                 const progressLeft = centerX(sIdx);
                 const progressRight = (progressVisibleEnd < endDate && pIdx < eIdx)
@@ -2099,27 +2196,33 @@ function drawMainSchedule(task, main, mainIndex = 0) {
     }
 
     if (startDate >= rangeStart && startDate <= rangeEnd) {
-        const pt = document.createElement("div");
-        const startDone = main.progressEndDate && isoToDate(main.progressEndDate).getTime() >= startDate.getTime();
-        pt.className = "point main-point" + (startDone ? " done" : "") + (isProgressSelected ? " progress-active" : "");
-        pt.style.left = centerX(dateToIndex(main.startDate)) + "px";
-        pt.style.top = MAIN_LINE_Y + "px";
-        pt.style.cursor = "grab";
-        attachMainEndpointInteractions(pt, task, main, "start", () => editMainEndpointLabel(task, main, "start"));
-        task.segLayerEl.appendChild(pt);
-        drawMainEndpointLabel(task, main, "start", centerX(dateToIndex(main.startDate)), main.startLabel || "", isProgressSelected);
+        const startIdx = dateToIndex(main.startDate);
+        if (startIdx !== -1) {
+            const pt = document.createElement("div");
+            const startDone = main.progressEndDate && isoToDate(main.progressEndDate).getTime() >= startDate.getTime();
+            pt.className = "point main-point" + (startDone ? " done" : "") + (isProgressSelected ? " progress-active" : "");
+            pt.style.left = centerX(startIdx) + "px";
+            pt.style.top = MAIN_LINE_Y + "px";
+            pt.style.cursor = "grab";
+            attachMainEndpointInteractions(pt, task, main, "start", () => editMainEndpointLabel(task, main, "start"));
+            task.segLayerEl.appendChild(pt);
+            drawMainEndpointLabel(task, main, "start", centerX(startIdx), main.startLabel || "", isProgressSelected);
+        }
     }
 
     if (endDate >= rangeStart && endDate <= rangeEnd) {
-        const pt = document.createElement("div");
-        const endDone = main.progressEndDate && isoToDate(main.progressEndDate).getTime() >= endDate.getTime();
-        pt.className = "point main-point" + (endDone ? " done" : "") + (isProgressSelected ? " progress-active" : "");
-        pt.style.left = centerX(dateToIndex(main.endDate)) + "px";
-        pt.style.top = MAIN_LINE_Y + "px";
-        pt.style.cursor = "grab";
-        attachMainEndpointInteractions(pt, task, main, "end", () => editMainEndpointLabel(task, main, "end"));
-        task.segLayerEl.appendChild(pt);
-        drawMainEndpointLabel(task, main, "end", centerX(dateToIndex(main.endDate)), main.endLabel || "", isProgressSelected);
+        const endIdx = dateToIndex(main.endDate);
+        if (endIdx !== -1) {
+            const pt = document.createElement("div");
+            const endDone = main.progressEndDate && isoToDate(main.progressEndDate).getTime() >= endDate.getTime();
+            pt.className = "point main-point" + (endDone ? " done" : "") + (isProgressSelected ? " progress-active" : "");
+            pt.style.left = centerX(endIdx) + "px";
+            pt.style.top = MAIN_LINE_Y + "px";
+            pt.style.cursor = "grab";
+            attachMainEndpointInteractions(pt, task, main, "end", () => editMainEndpointLabel(task, main, "end"));
+            task.segLayerEl.appendChild(pt);
+            drawMainEndpointLabel(task, main, "end", centerX(endIdx), main.endLabel || "", isProgressSelected);
+        }
     }
 
     const milestones = [...(main.milestones || [])].sort((a, b) => a.date.localeCompare(b.date));
@@ -2330,9 +2433,10 @@ function drawRangeSegment(task, seg, sIdx, eIdx, topPx) {
     addSegEvents(div, task, seg);
     task.segLayerEl.appendChild(div);
 
-    const minI = Math.min(dateToIndex(seg.startDate), dateToIndex(seg.endDate));
-    const maxI = Math.max(dateToIndex(seg.startDate), dateToIndex(seg.endDate));
-    if (minI !== -1 && maxI !== -1) {
+    const visibleRange = getVisibleRangeIndices(seg.startDate, seg.endDate);
+    if (visibleRange) {
+        const minI = visibleRange.sIdx;
+        const maxI = visibleRange.eIdx;
         for (let i = minI; i <= maxI; i++) {
             const iso = timelineDays[i].iso;
             const x = centerX(i);
@@ -2354,11 +2458,11 @@ function drawRangeSegment(task, seg, sIdx, eIdx, topPx) {
     }
 
     if (seg.progressEndDate) {
-        const sIdxRaw = dateToIndex(seg.startDate);
-        const pIdxRaw = dateToIndex(seg.progressEndDate);
+        const sIdxRaw = dateToVisibleIndexAtOrAfter(seg.startDate);
+        const pIdxRaw = dateToVisibleIndexAtOrBefore(seg.progressEndDate);
         if (sIdxRaw !== -1 && pIdxRaw !== -1 && pIdxRaw >= sIdxRaw) {
             const left = centerX(sIdxRaw);
-            const eIdxRaw = dateToIndex(seg.endDate);
+            const eIdxRaw = dateToVisibleIndexAtOrBefore(seg.endDate);
             let right = (eIdxRaw !== -1 && pIdxRaw < eIdxRaw) ? (pIdxRaw + 1) * CELL_WIDTH : centerX(pIdxRaw);
             const w = right - left;
             if (w > 0) {
@@ -2597,7 +2701,7 @@ function handleGlobalMouseUp(e) {
 
         if (task && seg && dayDelta !== 0) {
             if (dragState.scope === "milestone" && dragState.type === "move") {
-                const shiftedDate = shiftDateStr(dragState.originalStartDate, dayDelta);
+                const shiftedDate = shiftDateByVisibleColumns(dragState.originalStartDate, dayDelta);
                 const main = findMainScheduleById(task, dragState.mainId);
                 if (main) {
                     const clampedDate = shiftedDate < main.startDate
@@ -2612,22 +2716,22 @@ function handleGlobalMouseUp(e) {
                     const refTask = taskObjects.find(t => t.id === ref.taskId);
                     const refSeg = refTask ? refTask.segments.find(s => s.id === ref.segId) : null;
                     if (!refSeg) return;
-                    refSeg.startDate = shiftDateStr(ref.originalStartDate, dayDelta);
-                    refSeg.endDate = shiftDateStr(ref.originalEndDate, dayDelta);
+                    refSeg.startDate = shiftDateByVisibleColumns(ref.originalStartDate, dayDelta);
+                    refSeg.endDate = shiftDateByVisibleColumns(ref.originalEndDate, dayDelta);
                     if (refSeg.dailyValues) {
                         const newVals = {};
-                        Object.keys(refSeg.dailyValues).forEach(iso => newVals[shiftDateStr(iso, dayDelta)] = refSeg.dailyValues[iso]);
+                        Object.keys(refSeg.dailyValues).forEach(iso => newVals[shiftDateByVisibleColumns(iso, dayDelta)] = refSeg.dailyValues[iso]);
                         refSeg.dailyValues = newVals;
                     }
                     if (refSeg.dailyResults) {
                         const newRes = {};
-                        Object.keys(refSeg.dailyResults).forEach(iso => newRes[shiftDateStr(iso, dayDelta)] = refSeg.dailyResults[iso]);
+                        Object.keys(refSeg.dailyResults).forEach(iso => newRes[shiftDateByVisibleColumns(iso, dayDelta)] = refSeg.dailyResults[iso]);
                         refSeg.dailyResults = newRes;
                     }
                 });
             } else if (dragState.type === "move") {
-                const nextStartDate = shiftDateStr(dragState.originalStartDate, dayDelta);
-                const nextEndDate = shiftDateStr(dragState.originalEndDate, dayDelta);
+                const nextStartDate = shiftDateByVisibleColumns(dragState.originalStartDate, dayDelta);
+                const nextEndDate = shiftDateByVisibleColumns(dragState.originalEndDate, dayDelta);
 
                 if (dragState.scope === "main" && hasOverlappingMainSchedule(task, nextStartDate, nextEndDate, seg.id)) {
                     alert("メイン計画は重複して設定できません。別の日付範囲を指定してください。");
@@ -2638,24 +2742,24 @@ function handleGlobalMouseUp(e) {
                     if (dragState.scope === "main" && Array.isArray(seg.milestones)) {
                         seg.milestones = seg.milestones.map(ms => ({
                             ...ms,
-                            date: shiftDateStr(ms.date, dayDelta)
+                            date: shiftDateByVisibleColumns(ms.date, dayDelta)
                         }));
                     }
 
                     if (dragState.scope !== "main" && seg.dailyValues) {
                         const newVals = {};
-                        Object.keys(seg.dailyValues).forEach(iso => newVals[shiftDateStr(iso, dayDelta)] = seg.dailyValues[iso]);
+                        Object.keys(seg.dailyValues).forEach(iso => newVals[shiftDateByVisibleColumns(iso, dayDelta)] = seg.dailyValues[iso]);
                         seg.dailyValues = newVals;
                     }
                     if (dragState.scope !== "main" && seg.dailyResults) {
                         const newRes = {};
-                        Object.keys(seg.dailyResults).forEach(iso => newRes[shiftDateStr(iso, dayDelta)] = seg.dailyResults[iso]);
+                        Object.keys(seg.dailyResults).forEach(iso => newRes[shiftDateByVisibleColumns(iso, dayDelta)] = seg.dailyResults[iso]);
                         seg.dailyResults = newRes;
                     }
                 }
 
             } else if (dragState.type === "resize-right") {
-                const newEnd = shiftDateStr(dragState.originalEndDate, dayDelta);
+                const newEnd = shiftDateByVisibleColumns(dragState.originalEndDate, dayDelta);
                 const nextEnd = newEnd < seg.startDate ? seg.startDate : newEnd;
                 if (dragState.scope === "main" && hasOverlappingMainSchedule(task, seg.startDate, nextEnd, seg.id)) {
                     alert("メイン計画は重複して設定できません。");
@@ -2663,7 +2767,7 @@ function handleGlobalMouseUp(e) {
                     seg.endDate = nextEnd;
                 }
             } else if (dragState.type === "resize-left") {
-                const newStart = shiftDateStr(dragState.originalStartDate, dayDelta);
+                const newStart = shiftDateByVisibleColumns(dragState.originalStartDate, dayDelta);
                 const nextStart = newStart > seg.endDate ? seg.endDate : newStart;
                 if (dragState.scope === "main" && hasOverlappingMainSchedule(task, nextStart, seg.endDate, seg.id)) {
                     alert("メイン計画は重複して設定できません。");
@@ -3014,6 +3118,13 @@ if (collapseAllSubsBtn) {
 }
 if (expandAllSubsBtn) {
     expandAllSubsBtn.addEventListener("click", () => setAllTaskSubSchedulesCollapsed(false));
+}
+if (toggleHolidaysBtn) {
+    toggleHolidaysBtn.addEventListener("click", () => {
+        appData.settings.hideHolidays = appData.settings.hideHolidays !== true;
+        refreshTimelineDisplay();
+        triggerSave();
+    });
 }
 
 // ============================================

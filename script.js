@@ -139,6 +139,7 @@ const DataManager = {
 // ============================================
 const CELL_WIDTH = 28;
 const MAIN_LINE_Y = 32;
+const MAIN_LABEL_BASE_TOP = MAIN_LINE_Y - 20;
 const MAIN_DIVIDER_Y = 66;
 const SUB_SCHEDULE_TOP = 103;
 const BASE_ROW_HEIGHT = 129;
@@ -149,16 +150,40 @@ const now = new Date();
 const todayISO = dateToISO(now);
 const defaultStart = new Date(now.getFullYear(), now.getMonth(), 1);
 const defaultEnd = new Date(now.getFullYear(), now.getMonth() + 3, 0);
-const DEFAULT_TODO_COLUMNS = "項目1, 項目2, 時間, 実施内容, 計画, 実績, メモ";
+const DEFAULT_TODO_COLUMNS = "項目1, 項目2, 担当, 実施内容, 計画, 実績, メモ";
 const LEGACY_TODO_COLUMNS = "項目1, 項目2, 時間, 実施内容, 計画, 実績";
+const LEGACY_TODO_COLUMNS_V2 = "項目1, 項目2, 時間, 実施内容, 計画, 実績, メモ";
+// 旧バージョンの固定列名 -> 項目列の位置
+const LEGACY_ITEM_COLUMN_INDEX = { "項目1": 0, "項目2": 1, "担当": 2, "時間": 2 };
 const DEFAULT_FREE_MEMO_HEIGHT = 116;
 const MIN_FREE_MEMO_HEIGHT = 38;
 const MAX_IMPORT_FILE_BYTES = 2 * 1024 * 1024;
+const EXCEL_SHEET_PLAN = "計画";
+const EXCEL_SHEET_MEMO = "メモ";
+const EXCEL_FILE_PREFIX = "日程表：";
+const EXCEL_COL = {
+    done: "完",
+    hidden: "非表示",
+    memo: "項目1メモ",
+    type: "M/S",
+    comment: "コメント",
+    start: "開始予定",
+    end: "終了予定",
+    progress: "進捗(1-10)"
+};
+const EXCEL_TYPE = { mainAll: "M全", mainStart: "M始", mainEnd: "M終", milestone: "M", sub: "S" };
 const MAX_PLAN_TASKS = 500;
 const MAX_TASK_SEGMENTS = 300;
 const MAX_MAIN_SCHEDULES = 100;
 const MAX_DEPENDENCIES = 2000;
 const MAX_STRING_LENGTH = 3000;
+const MAX_ITEM_COLUMNS = 9;
+const MIN_ITEM_COLUMNS = 1;
+const DEFAULT_HEADERS = ["項目1", "項目2", "担当"];
+const DEFAULT_COLUMN_WIDTHS = [30, 120, 90, 40];
+const GRIP_COLUMN_WIDTH = 30;
+const DEFAULT_ITEM_COLUMN_WIDTH = 90;
+const FIXED_TODO_COLUMNS = ["実施内容", "計画", "実績", "メモ"];
 
 let appData = {
     projectName: "標準の計画",
@@ -168,11 +193,13 @@ let appData = {
         endDate: dateToISO(defaultEnd),
         holidays: [],
         showMainLine: true,
-        hideHolidays: false
+        hideHolidays: false,
+        memoCollapsed: false,
+        memoWidth: 0
     },
-    headers: ["項目1", "項目2", "時間"], 
+    headers: DEFAULT_HEADERS.slice(),
     todoColumns: DEFAULT_TODO_COLUMNS,
-    columnWidths: [30, 120, 90, 40],
+    columnWidths: DEFAULT_COLUMN_WIDTHS.slice(),
     dependencies: [],
     tasks: [],
     memo: "",
@@ -228,6 +255,12 @@ const leftRowsContainer = document.getElementById("leftRows");
 const rangeLabel = document.getElementById("rangeLabel");
 const ganttRight = document.getElementById("ganttRight");
 const freeMemo = document.getElementById("freeMemo");
+const freeMemoArea = document.getElementById("freeMemoArea");
+const memoToggleBtn = document.getElementById("memoToggleBtn");
+const memoSplitter = document.getElementById("memoSplitter");
+let isResizingMemo = false;
+let memoResizeStartX = 0;
+let memoResizeStartWidth = 0;
 const showHiddenCheck = document.getElementById("showHiddenCheck");
 const showMainLineCheck = document.getElementById("showMainLineCheck");
 const collapseAllSubsBtn = document.getElementById("collapseAllSubsBtn");
@@ -249,6 +282,9 @@ let contextMenuTargetSegAnchor = null;
 const dependencyContextMenu = document.getElementById("dependencyContextMenu");
 let contextMenuTargetDependencyId = null;
 
+const headerContextMenu = document.getElementById("headerContextMenu");
+let contextMenuTargetHeaderIndex = null;
+
 const settingsPanel = document.getElementById("settingsPanel");
 const totalRow = document.getElementById("totalRow");
 const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
@@ -262,7 +298,7 @@ const taskMemoClose = document.getElementById("taskMemoClose");
 let memoPanelTaskId = null;
 let memoPanelPinned = false;
 
-let leftColumnWidths = [30, 120, 90, 40];
+let leftColumnWidths = DEFAULT_COLUMN_WIDTHS.slice();
 let isResizingCol = false;
 let resizeColIndex = null;
 let resizeStartX = 0;
@@ -276,6 +312,115 @@ let resizeStartHeight = 0;
 // ============================================
 // ヘルパー関数
 // ============================================
+function nextItemColumnName(existing) {
+    for (let n = 1; n <= MAX_ITEM_COLUMNS; n++) {
+        const name = "項目" + n;
+        if (!existing.includes(name)) return name;
+    }
+    return "項目";
+}
+
+function normalizeHeaders(headers) {
+    const source = Array.isArray(headers) ? headers : [];
+    const list = [];
+    source.slice(0, MAX_ITEM_COLUMNS).forEach(h => {
+        const text = (typeof h === "string") ? h.slice(0, 40) : "";
+        list.push(text.trim() === "" ? nextItemColumnName(list) : text);
+    });
+    while (list.length < MIN_ITEM_COLUMNS) list.push(nextItemColumnName(list));
+    return list;
+}
+
+function normalizeColumnWidths(widths, headerCount) {
+    const source = Array.isArray(widths) ? widths : [];
+    const gripWidth = Number(source[0]);
+    const out = [Number.isFinite(gripWidth) ? gripWidth : GRIP_COLUMN_WIDTH];
+    for (let i = 0; i < headerCount; i++) {
+        const w = Number(source[i + 1]);
+        const fallback = DEFAULT_COLUMN_WIDTHS[i + 1] ?? DEFAULT_ITEM_COLUMN_WIDTH;
+        out.push(Number.isFinite(w) ? w : fallback);
+    }
+    return out;
+}
+
+// 旧形式(label1/label2/label3)も読めるようにする
+function readTaskLabels(taskData, count) {
+    let labels = Array.isArray(taskData?.labels)
+        ? taskData.labels.map(v => (typeof v === "string" ? v : ""))
+        : [taskData?.label1, taskData?.label2, taskData?.label3].map(v => (typeof v === "string" ? v : ""));
+    labels = labels.slice(0, count);
+    while (labels.length < count) labels.push("");
+    return labels;
+}
+
+function getTaskLabelEditables(task) {
+    if (!task?.leftRowEl) return [];
+    return Array.from(task.leftRowEl.querySelectorAll(".label-cell > .editable"));
+}
+
+function getTaskLabels(task) {
+    return getTaskLabelEditables(task).map(el => el.textContent);
+}
+
+// 貼り付けや編集で入り込んだ装飾(色・太字など)を取り除き、保存内容と同じプレーンテキストに揃える
+function stripEditableFormatting(el) {
+    if (!el) return;
+    const text = el.textContent;
+    if (el.children.length > 0 || el.innerHTML !== text) {
+        el.textContent = text;
+    }
+}
+
+// contenteditable に装飾が入らないようにする（貼り付けはプレーンテキスト、離れるときに整形）
+function setupPlainTextEditing(el, onBlur) {
+    el.addEventListener("paste", (e) => {
+        e.preventDefault();
+        const text = ((e.clipboardData || window.clipboardData)?.getData("text/plain") || "").replace(/\r?\n/g, " ");
+        document.execCommand("insertText", false, text);
+    });
+    el.addEventListener("blur", () => {
+        stripEditableFormatting(el);
+        if (onBlur) onBlur();
+    });
+}
+
+function getHeaderCells() {
+    return Array.from(document.querySelectorAll(".left-header .left-header-cell"));
+}
+
+function getHeaderTexts() {
+    const cells = getHeaderCells();
+    if (cells.length === 0) return normalizeHeaders(appData.headers);
+    return cells.map(el => el.textContent);
+}
+
+function getDefaultTodoColumns(headers) {
+    return [...(headers || getHeaderTexts()), ...FIXED_TODO_COLUMNS].join(", ");
+}
+
+// 保存済みの列名（旧固定名や改名前の名前）を現在のヘッダー名に読み替える
+function normalizeTodoColumns(cols, itemHeaders) {
+    const headers = itemHeaders || getHeaderTexts();
+    return cols.map(col => {
+        if (headers.includes(col)) return col;
+        const legacy = LEGACY_ITEM_COLUMN_INDEX[col];
+        if (legacy != null && legacy < headers.length) return headers[legacy];
+        return col;
+    });
+}
+
+function todoColumnKey(col, itemHeaders) {
+    const headers = itemHeaders || getHeaderTexts();
+    const idx = headers.indexOf(col);
+    if (idx !== -1) return "item:" + idx;
+    if (col === "実施内容") return "desc";
+    if (col === "計画") return "plan";
+    if (col === "実績") return "actual";
+    if (col === "メモ") return "memo";
+    const legacy = LEGACY_ITEM_COLUMN_INDEX[col];
+    if (legacy != null && legacy < headers.length) return "item:" + legacy;
+    return "unknown";
+}
 function pad2(n) { return String(n).padStart(2, "0"); }
 function dateToISO(d) { return d.getFullYear() + "-" + pad2(d.getMonth() + 1) + "-" + pad2(d.getDate()); }
 function isoToDate(iso) { const [y, m, d] = iso.split("-").map(Number); return new Date(y, m - 1, d); }
@@ -353,21 +498,56 @@ function setFreeMemoText(text) {
     freeMemo.value = text || "";
 }
 
-function getFreeMemoHeight() {
-    if (!freeMemo) return DEFAULT_FREE_MEMO_HEIGHT;
-    const raw = parseFloat(freeMemo.style.height);
-    if (!Number.isNaN(raw) && raw > 0) return raw;
-    return Math.max(MIN_FREE_MEMO_HEIGHT, freeMemo.offsetHeight || 0);
+// メモ・備考欄の幅の下限と、日程表側に必ず残す幅
+const MIN_MEMO_WIDTH = 200;   // style.css の .free-memo-area { min-width } と揃える
+const MIN_GANTT_WIDTH = 320;
+
+// 今そのときに指定できるメモ欄の幅の範囲
+function getMemoWidthLimits() {
+    const mainArea = document.querySelector(".main-area");
+    const total = mainArea ? mainArea.getBoundingClientRect().width : window.innerWidth;
+    const splitter = memoSplitter ? memoSplitter.getBoundingClientRect().width : 12;
+    const max = Math.max(MIN_MEMO_WIDTH, total - splitter - MIN_GANTT_WIDTH);
+    return { min: MIN_MEMO_WIDTH, max };
 }
 
-function applyFreeMemoHeight(height) {
-    if (!freeMemo) return;
-    const nextHeight = Math.max(MIN_FREE_MEMO_HEIGHT, Number(height) || DEFAULT_FREE_MEMO_HEIGHT);
-    isApplyingFreeMemoHeight = true;
-    freeMemo.style.height = `${nextHeight}px`;
-    requestAnimationFrame(() => {
-        isApplyingFreeMemoHeight = false;
-    });
+// 幅を反映する。0 や未設定なら既定（全体の1/4）に戻す
+function applyMemoWidth(width) {
+    if (!freeMemoArea) return 0;
+    // 閉じているときはCSS側の指定を使うので、個別指定を外す
+    if (freeMemoArea.classList.contains("memo-collapsed")) {
+        freeMemoArea.style.flex = "";
+        freeMemoArea.style.maxWidth = "";
+        return Number(width) || 0;
+    }
+    const raw = Number(width);
+    if (!Number.isFinite(raw) || raw <= 0) {
+        freeMemoArea.style.flex = "";
+        freeMemoArea.style.maxWidth = "";
+        return 0;
+    }
+    const { min, max } = getMemoWidthLimits();
+    const next = Math.round(Math.max(min, Math.min(max, raw)));
+    freeMemoArea.style.flex = `0 0 ${next}px`;
+    freeMemoArea.style.maxWidth = "none";
+    return next;
+}
+
+function setMemoCollapsed(collapsed, options = {}) {
+    const isCollapsed = !!collapsed;
+    if (freeMemoArea) freeMemoArea.classList.toggle("memo-collapsed", isCollapsed);
+    if (memoSplitter) memoSplitter.style.display = isCollapsed ? "none" : "";
+    if (memoToggleBtn) {
+        memoToggleBtn.textContent = isCollapsed ? "◀" : "▶";
+        memoToggleBtn.title = isCollapsed ? "メモ・備考を開く" : "メモ・備考を閉じる";
+        memoToggleBtn.setAttribute("aria-expanded", String(!isCollapsed));
+    }
+    if (appData?.settings) {
+        appData.settings.memoCollapsed = isCollapsed;
+        applyMemoWidth(appData.settings.memoWidth);
+    }
+    if (!options.skipSave) triggerSave();
+    scheduleProgressGuideRefresh();
 }
 
 function createEmptyPlanData(name = "標準の計画") {
@@ -379,11 +559,13 @@ function createEmptyPlanData(name = "標準の計画") {
             endDate: dateToISO(defaultEnd),
             holidays: [],
             showMainLine: true,
-            hideHolidays: false
+            hideHolidays: false,
+            memoCollapsed: false,
+            memoWidth: 0
         },
-        headers: ["項目1", "項目2", "時間"],
+        headers: DEFAULT_HEADERS.slice(),
         todoColumns: DEFAULT_TODO_COLUMNS,
-        columnWidths: [30, 120, 90, 40],
+        columnWidths: DEFAULT_COLUMN_WIDTHS.slice(),
         dependencies: [],
         tasks: [],
         memo: "",
@@ -453,6 +635,9 @@ function sanitizeImportedPlanData(raw) {
     }
 
     const base = createEmptyPlanData(sanitizeString(raw.projectName, "標準の計画", 120));
+    const importedHeaders = normalizeHeaders(Array.isArray(raw.headers)
+        ? raw.headers.map((h, i) => sanitizeString(h, base.headers[i] || "", 40))
+        : base.headers.slice());
     const startDate = sanitizeIsoDate(raw?.settings?.startDate, base.settings.startDate);
     const endDate = sanitizeIsoDate(raw?.settings?.endDate, base.settings.endDate);
 
@@ -464,15 +649,13 @@ function sanitizeImportedPlanData(raw) {
             endDate,
             holidays: sanitizeStringArray(raw?.settings?.holidays, 366, 16),
             showMainLine: raw?.settings?.showMainLine !== false,
-            hideHolidays: raw?.settings?.hideHolidays === true
+            hideHolidays: raw?.settings?.hideHolidays === true,
+            memoCollapsed: raw?.settings?.memoCollapsed === true,
+            memoWidth: Number.isFinite(Number(raw?.settings?.memoWidth)) ? Math.max(0, Number(raw.settings.memoWidth)) : 0
         },
-        headers: Array.isArray(raw.headers)
-            ? raw.headers.slice(0, 3).map((h, i) => sanitizeString(h, base.headers[i] || "", 40))
-            : base.headers.slice(),
+        headers: importedHeaders,
         todoColumns: sanitizeString(raw.todoColumns, DEFAULT_TODO_COLUMNS, 500),
-        columnWidths: Array.isArray(raw.columnWidths)
-            ? raw.columnWidths.slice(0, 4).map((w, i) => Number.isFinite(Number(w)) ? Number(w) : base.columnWidths[i])
-            : base.columnWidths.slice(),
+        columnWidths: normalizeColumnWidths(raw.columnWidths, importedHeaders.length),
         dependencies: [],
         tasks: [],
         memo: sanitizeString(raw.memo, "", 200000),
@@ -503,9 +686,8 @@ function sanitizeImportedPlanData(raw) {
 
         const normalizedTask = {
             id: sanitizeString(task?.id, `task_${taskIndex}`, 120),
-            label1: sanitizeString(task?.label1, "", 200),
-            label2: sanitizeString(task?.label2, "", 200),
-            label3: sanitizeString(task?.label3, "", 80),
+            labels: readTaskLabels(task, importedHeaders.length)
+                .map(v => sanitizeString(v, "", 200)),
             mainSchedules,
             segments: Array.isArray(task?.segments)
                 ? task.segments.slice(0, MAX_TASK_SEGMENTS).map((seg, segIndex) => ({
@@ -638,6 +820,144 @@ function switchPlan(planId, options = {}) {
     return true;
 }
 
+// ============================================
+// 項目列（左側）の描画・追加・削除
+// ============================================
+function renderLeftHeader() {
+    const header = document.querySelector(".left-header");
+    if (!header) return;
+    header.querySelectorAll(".left-header-cell").forEach(el => el.remove());
+
+    const headers = normalizeHeaders(appData.headers);
+    appData.headers = headers;
+
+    headers.forEach((text, i) => {
+        const cell = document.createElement("div");
+        cell.className = "left-header-cell";
+        cell.id = "lh" + (i + 1);
+        cell.contentEditable = "true";
+        cell.dataset.colIndex = String(i);
+        cell.textContent = text;
+        cell.title = "右クリックで項目列を追加・削除できます";
+
+        cell.addEventListener("paste", (e) => {
+            e.preventDefault();
+            const text = ((e.clipboardData || window.clipboardData)?.getData("text/plain") || "").replace(/\r?\n/g, " ");
+            document.execCommand("insertText", false, text);
+        });
+        cell.addEventListener("blur", () => {
+            stripEditableFormatting(cell);
+            const gridIndex = i + 1;
+            const previousName = appData.headers[i];
+            const nextName = cell.textContent.trim();
+            if (nextName === "") {
+                cell.textContent = previousName;
+            } else if (nextName !== previousName) {
+                renameTodoColumn(previousName, nextName);
+                appData.headers[i] = nextName;
+            }
+            leftColumnWidths[gridIndex] = clampColumnWidth(gridIndex, leftColumnWidths[gridIndex]);
+            applyLeftColumnWidths();
+            triggerSave();
+        });
+        cell.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            showHeaderContextMenu(e, i);
+        });
+
+        header.appendChild(cell);
+    });
+}
+
+// ヘッダー名を変えたら、ToDoの出力項目の指定も追随させる
+function renameTodoColumn(previousName, nextName) {
+    if (!previousName || previousName === nextName) return;
+    const input = document.getElementById("todoColumnsInput");
+    if (!input) return;
+    const cols = input.value.split(",").map(v => v.trim()).filter(Boolean);
+    if (!cols.includes(previousName)) return;
+    input.value = cols.map(c => (c === previousName ? nextName : c)).join(", ");
+    appData.todoColumns = input.value;
+}
+
+function addItemColumn(atIndex) {
+    syncDataModel();
+    if (appData.headers.length >= MAX_ITEM_COLUMNS) {
+        alert(`項目列は最大${MAX_ITEM_COLUMNS}列までです。`);
+        return;
+    }
+    const index = Math.max(0, Math.min(appData.headers.length, atIndex));
+    appData.headers.splice(index, 0, nextItemColumnName(appData.headers));
+    appData.columnWidths.splice(index + 1, 0, DEFAULT_ITEM_COLUMN_WIDTH);
+    appData.tasks.forEach(t => {
+        if (!Array.isArray(t.labels)) t.labels = [];
+        t.labels.splice(index, 0, "");
+    });
+    const input = document.getElementById("todoColumnsInput");
+    if (input) {
+        const cols = input.value.split(",").map(v => v.trim()).filter(Boolean);
+        const name = appData.headers[index];
+        if (!cols.includes(name)) {
+            const anchor = index > 0 ? appData.headers[index - 1] : null;
+            const at = anchor ? cols.indexOf(anchor) : -1;
+            cols.splice(at >= 0 ? at + 1 : (index > 0 ? cols.length : 0), 0, name);
+            input.value = cols.join(", ");
+            appData.todoColumns = input.value;
+        }
+    }
+    restoreFromData(appData);
+    triggerSave();
+}
+
+function removeItemColumn(index) {
+    syncDataModel();
+    if (index < 0 || index >= appData.headers.length) return;
+    if (appData.headers.length <= MIN_ITEM_COLUMNS) {
+        alert("項目列は最低1列必要です。");
+        return;
+    }
+    const name = appData.headers[index];
+    const hasContent = appData.tasks.some(t => (t.labels || [])[index]);
+    const warning = hasContent
+        ? `項目列「${name}」を削除します。
+この列に入力済みの内容もすべて削除されます。よろしいですか？`
+        : `項目列「${name}」を削除しますか？`;
+    if (!confirm(warning)) return;
+
+    appData.headers.splice(index, 1);
+    appData.columnWidths.splice(index + 1, 1);
+    appData.tasks.forEach(t => {
+        if (Array.isArray(t.labels)) t.labels.splice(index, 1);
+    });
+    const input = document.getElementById("todoColumnsInput");
+    if (input) {
+        input.value = input.value.split(",").map(v => v.trim()).filter(Boolean)
+            .filter(c => c !== name).join(", ");
+        appData.todoColumns = input.value;
+    }
+    restoreFromData(appData);
+    triggerSave();
+}
+
+function showHeaderContextMenu(e, index) {
+    if (!headerContextMenu) return;
+    contextMenuTargetHeaderIndex = index;
+    const canAdd = appData.headers.length < MAX_ITEM_COLUMNS;
+    const canDelete = appData.headers.length > MIN_ITEM_COLUMNS;
+    const addLeft = document.getElementById("ctxHeaderAddLeft");
+    const addRight = document.getElementById("ctxHeaderAddRight");
+    const del = document.getElementById("ctxHeaderDelete");
+    if (addLeft) addLeft.classList.toggle("menu-disabled", !canAdd);
+    if (addRight) addRight.classList.toggle("menu-disabled", !canAdd);
+    if (del) del.classList.toggle("menu-disabled", !canDelete);
+
+    hideContextMenus();
+    headerContextMenu.style.display = "block";
+    headerContextMenu.style.left = e.pageX + "px";
+    headerContextMenu.style.top = e.pageY + "px";
+}
+
 function applyLeftColumnWidths() {
     const cols = leftColumnWidths.map(w => `${w}px`).join(" ");
     const header = document.querySelector(".left-header");
@@ -658,8 +978,9 @@ function applyLeftColumnWidths() {
 }
 
 function measureMinWidthForHeader(index) {
-    const ids = ["rowSelectHeader", "lh1", "lh2", "lh3"];
-    const el = document.getElementById(ids[index]);
+    const el = (index === 0)
+        ? document.getElementById("rowSelectHeader")
+        : getHeaderCells()[index - 1];
     if (!el) return 40;
     const text = el.textContent || "";
     const probe = document.createElement("span");
@@ -812,7 +1133,7 @@ function normalizeMainSchedule(mainSchedule) {
         id: mainSchedule.id || ("main_" + Date.now() + "_" + Math.random().toString(36).slice(2)),
         startDate: mainSchedule.startDate,
         endDate: mainSchedule.endDate,
-        label: mainSchedule.label || "メイン計画",
+        label: typeof mainSchedule.label === "string" ? mainSchedule.label : "",
         startLabel: mainSchedule.startLabel || "",
         endLabel: mainSchedule.endLabel || "",
         progressEndDate: mainSchedule.progressEndDate || null,
@@ -856,6 +1177,92 @@ function serializeMainSchedule(main) {
 
 function findMainScheduleById(task, mainId) {
     return (task.mainSchedules || []).find(main => main.id === mainId) || null;
+}
+
+// 実績が終了日まで達しているメイン計画か（＝未実施の部分が残っていない）
+function isMainFullyDone(main) {
+    if (!main?.progressEndDate) return false;
+    return isoToDate(main.progressEndDate).getTime() >= isoToDate(main.endDate).getTime();
+}
+
+// 表示されている日の並びの中での位置。その日が無ければ直前の日の位置を返す
+function visibleDayIndex(days, iso) {
+    const exact = days.indexOf(iso);
+    if (exact !== -1) return exact;
+    for (let k = days.length - 1; k >= 0; k--) {
+        if (days[k] <= iso) return k;
+    }
+    return 0;
+}
+
+// マイルストーンを「開始日のコメント」「終了日のコメント」「途中のコメント」に分ける。
+// 端点かどうかは、伸縮する前の端点日付で判定する。
+function classifyMainMilestones(main, startIso, endIso) {
+    const list = Array.isArray(main?.milestones) ? [...main.milestones] : [];
+    list.sort((a, b) => a.date.localeCompare(b.date));
+    const startComment = list.find(ms => ms.date === startIso) || null;
+    const endComment = list.find(ms => ms !== startComment && ms.date === endIso) || null;
+    const others = list.filter(ms => ms !== startComment && ms !== endComment);
+    return { startComment, endComment, others };
+}
+
+// 途中のコメントは端点に重ねないので、端点ぶんの日数を別に確保する
+function requiredMainDayCount(main, startIso = main?.startDate, endIso = main?.endDate) {
+    const { startComment, endComment, others } = classifyMainMilestones(main, startIso, endIso);
+    if (others.length === 0) return (startComment && endComment) ? 2 : 1;
+    return others.length + 2;
+}
+
+// これ以上は縮められない終了日（開始日を固定して縮める場合）
+function minEndDateForMain(main) {
+    return shiftDateByVisibleColumns(main.startDate, requiredMainDayCount(main) - 1);
+}
+
+// これ以上は縮められない開始日（終了日を固定して縮める場合）
+function maxStartDateForMain(main) {
+    return shiftDateByVisibleColumns(main.endDate, -(requiredMainDayCount(main) - 1));
+}
+
+// 伸縮後に各コメントを置き直す。
+// 端点のコメントは端点に追従させ、途中のコメントは端点を避けて玉突きで内側に詰める。
+function layoutMainMilestones(main, previousStart, previousEnd) {
+    if (!main || !Array.isArray(main.milestones) || main.milestones.length === 0) return;
+    const { startComment, endComment, others } = classifyMainMilestones(main, previousStart, previousEnd);
+    if (startComment) startComment.date = main.startDate;
+    if (endComment) endComment.date = main.endDate;
+
+    if (others.length > 0) {
+        const bounds = [main.startDate, main.endDate, ...others.map(ms => ms.date)];
+        const days = listVisibleDays(
+            bounds.reduce((a, b) => (a < b ? a : b)),
+            bounds.reduce((a, b) => (a > b ? a : b))
+        );
+        // 途中のコメントが使えるのは端点の内側だけ
+        const innerFirst = visibleDayIndex(days, main.startDate) + 1;
+        const innerLast = visibleDayIndex(days, main.endDate) - 1;
+        if (innerLast >= innerFirst) {
+            // 終了日側からはみ出したものを、後ろから順に手前へ詰める
+            let limit = innerLast;
+            for (let i = others.length - 1; i >= 0; i--) {
+                const idx = visibleDayIndex(days, others[i].date);
+                if (idx <= limit) break;
+                const nextIdx = Math.max(innerFirst, limit);
+                others[i].date = days[nextIdx];
+                limit = nextIdx - 1;
+            }
+            // 開始日側からはみ出したものを、前から順に後ろへ詰める
+            let floor = innerFirst;
+            for (let i = 0; i < others.length; i++) {
+                const idx = visibleDayIndex(days, others[i].date);
+                if (idx >= floor) break;
+                const nextIdx = Math.min(innerLast, floor);
+                others[i].date = days[nextIdx];
+                floor = nextIdx + 1;
+            }
+        }
+    }
+
+    main.milestones.sort((a, b) => a.date.localeCompare(b.date));
 }
 
 function findMainScheduleByDate(task, iso) {
@@ -992,10 +1399,7 @@ function hasOverlappingMainSchedule(task, startIso, endIso, excludeId = null) {
 }
 
 function getTaskTitle(task) {
-    const t1 = task.leftRowEl.children[1].firstElementChild.textContent.trim();
-    const t2 = task.leftRowEl.children[2].firstElementChild.textContent.trim();
-    const t3 = task.leftRowEl.children[3].firstElementChild.textContent.trim();
-    const parts = [t1, t2, t3].filter(Boolean);
+    const parts = getTaskLabels(task).map(v => v.trim()).filter(Boolean);
     if (parts.length === 0) return "メモ";
     return "メモ: " + parts.join(" / ");
 }
@@ -1082,6 +1486,7 @@ function cancelActiveProgressSelection() {
 function hideContextMenus() {
     contextMenu.style.display = "none";
     segmentContextMenu.style.display = "none";
+    if (headerContextMenu) headerContextMenu.style.display = "none";
     if (dependencyContextMenu) dependencyContextMenu.style.display = "none";
     if (contextMenuTargetDependencyId) {
         contextMenuTargetDependencyId = null;
@@ -1185,9 +1590,7 @@ function syncDataModel() {
     appData.tasks = taskObjects.map(t => {
         return {
             id: t.id,
-            label1: t.leftRowEl.children[1].firstElementChild.textContent,
-            label2: t.leftRowEl.children[2].firstElementChild.textContent,
-            label3: t.leftRowEl.children[3].firstElementChild.textContent,
+            labels: getTaskLabels(t),
             mainSchedule: (t.mainSchedules && t.mainSchedules.length > 0) ? serializeMainSchedule(t.mainSchedules[0]) : null,
             mainSchedules: (t.mainSchedules || []).map(serializeMainSchedule),
             segments: t.segments.map(seg => ({
@@ -1211,16 +1614,12 @@ function syncDataModel() {
     appData.memoFormat = "plain";
     appData.projectName = projectNameInput.value;
     
-    appData.headers = [
-        document.getElementById("lh1").textContent,
-        document.getElementById("lh2").textContent,
-        document.getElementById("lh3").textContent
-    ];
+    appData.headers = getHeaderTexts();
     appData.todoColumns = document.getElementById("todoColumnsInput").value;
     appData.columnWidths = leftColumnWidths.slice();
     appData.dependencies = cleanupDependencies().map(dep => ({ ...dep }));
     appData.projectName = projectNameInput.value || "標準の計画";
-    appData.memoHeight = getFreeMemoHeight();
+    // memoHeight は旧レイアウト（メモ欄が下段）用の値。読み込んだ値をそのまま保持する
     updateCurrentPlanEntryFromAppData();
     refreshPlanSelect();
 }
@@ -1239,14 +1638,7 @@ projectNameInput.addEventListener("change", () => {
 freeMemo.addEventListener("input", () => {
     triggerSave();
 });
-["lh1", "lh2", "lh3"].forEach(id => {
-    document.getElementById(id).addEventListener("blur", () => {
-        const idx = id === "lh1" ? 1 : (id === "lh2" ? 2 : 3);
-        leftColumnWidths[idx] = clampColumnWidth(idx, leftColumnWidths[idx]);
-        applyLeftColumnWidths();
-        triggerSave();
-    });
-});
+
 
 // ============================================
 // 初期化 & 復元
@@ -1261,13 +1653,6 @@ async function initializeApp() {
     setTimeout(scrollToToday, 100);
     HistoryManager.init(appData);
     setupControlEvents();
-    if (freeMemo && typeof ResizeObserver !== "undefined" && !freeMemoResizeObserver) {
-        freeMemoResizeObserver = new ResizeObserver(() => {
-            if (isApplyingFreeMemoHeight || isRestoringData) return;
-            triggerSave();
-        });
-        freeMemoResizeObserver.observe(freeMemo);
-    }
     await DataManager.save(appStore);
 }
 
@@ -1284,15 +1669,31 @@ function restoreFromData(data) {
     if (typeof appData.settings.hideHolidays !== "boolean") {
         appData.settings.hideHolidays = false;
     }
-    if (!appData.headers) appData.headers = ["項目1", "項目2", "時間"];
-    if (!appData.columnWidths) appData.columnWidths = [30, 120, 90, 40];
+    if (typeof appData.settings.memoCollapsed !== "boolean") {
+        appData.settings.memoCollapsed = false;
+    }
+    if (!Number.isFinite(Number(appData.settings.memoWidth))) {
+        appData.settings.memoWidth = 0;
+    }
+    appData.headers = normalizeHeaders(appData.headers);
+    appData.columnWidths = normalizeColumnWidths(appData.columnWidths, appData.headers.length);
     if (!Array.isArray(appData.dependencies)) appData.dependencies = [];
     if (!appData.memoFormat) appData.memoFormat = "legacy-html";
     if (!appData.memoHeight) appData.memoHeight = DEFAULT_FREE_MEMO_HEIGHT;
     
-    if (!appData.todoColumns || appData.todoColumns === LEGACY_TODO_COLUMNS) {
+    if (!appData.todoColumns
+        || appData.todoColumns === LEGACY_TODO_COLUMNS
+        || appData.todoColumns === LEGACY_TODO_COLUMNS_V2) {
         appData.todoColumns = DEFAULT_TODO_COLUMNS;
     }
+    // 旧既定のヘッダー名「時間」は「担当」へ移行する（変更済みの名前はそのまま）
+    if (appData.headers[2] === "時間") appData.headers[2] = "担当";
+
+    // ToDoの出力項目に残っている旧列名を、現在のヘッダー名に置き換えておく
+    appData.todoColumns = normalizeTodoColumns(
+        appData.todoColumns.split(",").map(v => v.trim()).filter(Boolean),
+        appData.headers
+    ).join(", ");
 
     projectNameInput.value = data.projectName || "標準の計画";
     document.title = projectNameInput.value + " | 工程表";
@@ -1305,14 +1706,13 @@ function restoreFromData(data) {
         setFreeMemoText("");
     }
 
-    document.getElementById("lh1").textContent = appData.headers[0];
-    document.getElementById("lh2").textContent = appData.headers[1];
-    document.getElementById("lh3").textContent = appData.headers[2];
+    renderLeftHeader();
 
     document.getElementById("todoColumnsInput").value = appData.todoColumns;
     showMainLineCheck.checked = appData.settings.showMainLine !== false;
     updateHolidayToggleButton();
-    applyFreeMemoHeight(appData.memoHeight);
+    setMemoCollapsed(appData.settings.memoCollapsed === true, { skipSave: true });
+    applyMemoWidth(appData.settings.memoWidth);
 
     leftRowsContainer.innerHTML = "";
     rowsContainer.innerHTML = "";
@@ -1491,6 +1891,9 @@ function getVisibleTaskRows() {
 }
 
 function getGuideAnchorPoint(task, overlayRect) {
+    // 完了にした行は、実際の進捗に関わらず完了扱いとして縦に引く
+    if (task.isDone) return null;
+
     const mainSchedules = [...(task.mainSchedules || [])]
         .sort((a, b) => a.startDate.localeCompare(b.startDate));
 
@@ -1876,12 +2279,12 @@ function addTaskRow(initialData = null) {
     leftRow.addEventListener('drop', handleRowDrop);
     leftRow.addEventListener('dragend', handleRowDragEnd);
 
-    const createInput = (ph, text) => {
+    const createInput = (ph, text, isFirst) => {
         const cell = document.createElement("div"); cell.className = "label-cell";
         const ed = document.createElement("div"); ed.className = "editable"; ed.contentEditable = "true"; ed.dataset.placeholder = ph;
         if (text) ed.textContent = text;
-        ed.addEventListener('blur', triggerSave);
-        if (ph === "項目1") {
+        setupPlainTextEditing(ed, triggerSave);
+        if (isFirst) {
             const openMemo = (e) => {
                 e.stopPropagation();
                 openTaskMemo(task, task.leftRowEl, true);
@@ -1892,9 +2295,11 @@ function addTaskRow(initialData = null) {
         cell.appendChild(ed);
         return cell;
     };
-    leftRow.appendChild(createInput("項目1", initialData ? initialData.label1 : ""));
-    leftRow.appendChild(createInput("項目2", initialData ? initialData.label2 : ""));
-    leftRow.appendChild(createInput("時間", initialData ? initialData.label3 : ""));
+    const headerNames = normalizeHeaders(appData.headers);
+    const initialLabels = readTaskLabels(initialData, headerNames.length);
+    headerNames.forEach((name, i) => {
+        leftRow.appendChild(createInput(name, initialData ? initialLabels[i] : "", i === 0));
+    });
     leftRow.style.gridTemplateColumns = leftColumnWidths.map(w => `${w}px`).join(" ");
 
     const rowResize = document.createElement("div");
@@ -2144,15 +2549,22 @@ function drawMainSchedule(task, main, mainIndex = 0) {
     line.style.width = width + "px";
     line.style.top = MAIN_LINE_Y + "px";
 
-    const lHandle = document.createElement("div");
-    lHandle.className = "resize-handle left";
-    lHandle.addEventListener("mousedown", (e) => initDrag(e, task, main, "resize-left", line, "main"));
-    line.appendChild(lHandle);
+    // 実績があると開始日は動かせないので、サブ計画と同じく左ハンドルを作らない
+    if (main.progressEndDate) line.classList.add("fixed");
+    if (!main.progressEndDate) {
+        const lHandle = document.createElement("div");
+        lHandle.className = "resize-handle left";
+        lHandle.addEventListener("mousedown", (e) => initDrag(e, task, main, "resize-left", line, "main"));
+        line.appendChild(lHandle);
+    }
 
-    const rHandle = document.createElement("div");
-    rHandle.className = "resize-handle right";
-    rHandle.addEventListener("mousedown", (e) => initDrag(e, task, main, "resize-right", line, "main"));
-    line.appendChild(rHandle);
+    // 実績が終了日まで達している（＝未実施の部分が無い）ときは右ハンドルも作らない
+    if (!isMainFullyDone(main)) {
+        const rHandle = document.createElement("div");
+        rHandle.className = "resize-handle right";
+        rHandle.addEventListener("mousedown", (e) => initDrag(e, task, main, "resize-right", line, "main"));
+        line.appendChild(rHandle);
+    }
 
     line.addEventListener("mousedown", (e) => {
         if (e.target.classList.contains("resize-handle")) return;
@@ -2161,6 +2573,8 @@ function drawMainSchedule(task, main, mainIndex = 0) {
     line.addEventListener("dblclick", (e) => {
         e.preventDefault();
         e.stopPropagation();
+        if (isCtrlSelectionMode || e.ctrlKey) return;
+        editMainScheduleLabel(task, main);
     });
     line.addEventListener("contextmenu", (e) => {
         e.preventDefault();
@@ -2225,11 +2639,36 @@ function drawMainSchedule(task, main, mainIndex = 0) {
         }
     }
 
+    if (main.label) {
+        const lab = document.createElement("div");
+        lab.className = "segment-label main-label" + (isProgressSelected ? " progress-active" : "");
+        lab.textContent = main.label;
+        lab.style.left = ((sc + ec) / 2) + "px";
+        lab.dataset.baseTop = String(MAIN_LABEL_BASE_TOP);
+        lab.style.top = MAIN_LABEL_BASE_TOP + "px";
+        lab.addEventListener("click", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            if (isCtrlSelectionMode || e.ctrlKey || dependencyDraft) return;
+            editMainScheduleLabel(task, main);
+        });
+        lab.addEventListener("dblclick", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+        });
+        lab.addEventListener("contextmenu", (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            showSegmentContextMenu(e, task, { id: main.id, scheduleScope: "main" });
+        });
+        task.segLayerEl.appendChild(lab);
+    }
+
     const milestones = [...(main.milestones || [])].sort((a, b) => a.date.localeCompare(b.date));
-    milestones.forEach((milestone, index) => drawMainMilestone(task, main, milestone, index + (mainIndex * 100)));
+    milestones.forEach((milestone, index) => drawMainMilestone(task, main, milestone, index + (mainIndex * 100), line));
 }
 
-function drawMainMilestone(task, main, milestone, index) {
+function drawMainMilestone(task, main, milestone, index, mainLineEl = null) {
     const idx = dateToIndex(milestone.date);
     if (idx === -1) return;
     const x = centerX(idx);
@@ -2242,7 +2681,20 @@ function drawMainMilestone(task, main, milestone, index) {
     pt.style.left = x + "px";
     pt.style.top = MAIN_LINE_Y + "px";
     pt.style.cursor = "grab";
-    pt.addEventListener("mousedown", (e) => initDrag(e, task, { ...milestone, mainId: main.id }, "move", pt, "milestone"));
+    // 端点に重なっているマイルストーンは端点のコメントなので、掴んだら端点ごと動かす
+    const atStart = milestone.date === main.startDate;
+    const atEnd = milestone.date === main.endDate;
+    pt.addEventListener("mousedown", (e) => {
+        if (atStart && atEnd) {
+            initDrag(e, task, main, "move", mainLineEl || pt, "main");
+        } else if (atEnd) {
+            initDrag(e, task, main, "resize-right", mainLineEl || pt, "main");
+        } else if (atStart) {
+            initDrag(e, task, main, "resize-left", mainLineEl || pt, "main");
+        } else {
+            initDrag(e, task, { ...milestone, mainId: main.id }, "move", pt, "milestone");
+        }
+    });
     pt.addEventListener("dblclick", (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -2319,8 +2771,8 @@ function drawMainEndpointLabel(task, main, side, x, text, isProgressSelected = f
     label.className = "segment-label main-endpoint-label" + (isProgressSelected ? " progress-active" : "");
     label.textContent = text;
     label.style.left = x + "px";
-    label.dataset.baseTop = String(MAIN_LINE_Y - 23);
-    label.style.top = (MAIN_LINE_Y - 23) + "px";
+    label.dataset.baseTop = String(MAIN_LABEL_BASE_TOP);
+    label.style.top = MAIN_LABEL_BASE_TOP + "px";
     label.addEventListener("dblclick", (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -2337,6 +2789,15 @@ function drawMainEndpointLabel(task, main, side, x, text, isProgressSelected = f
         editMainEndpointLabel(task, main, side);
     });
     task.segLayerEl.appendChild(label);
+}
+
+function editMainScheduleLabel(task, main) {
+    if (!main) return;
+    const nextLabel = window.prompt("計画内容:", main.label || "");
+    if (nextLabel === null) return;
+    main.label = nextLabel.trim();
+    renderAllSegments();
+    triggerSave();
 }
 
 function editMainEndpointLabel(task, main, side) {
@@ -2581,7 +3042,7 @@ function drawDraftStart(task, index = null, topPx = 30) {
 }
 
 function adjustLabelPositions(task) {
-    const labels = Array.from(task.segLayerEl.querySelectorAll(".segment-label:not(.milestone-label):not(.main-endpoint-label)"));
+    const labels = Array.from(task.segLayerEl.querySelectorAll(".segment-label:not(.milestone-label)"));
     if (labels.length === 0) return;
 
     const groups = {};
@@ -2621,6 +3082,15 @@ function initDrag(e, task, seg, type, el, scope = "sub") {
     // ドラッグ中のマウス操作をこの機能が「乗っ取る」形にし、裏側のセルに反応させないようにする。
     if (scope === "sub" && type === "move" && seg.progressEndDate) {
         dragType = "blocked";
+    }
+
+    // メイン計画も同様に、実績が1日でもあれば全体移動と開始日の伸縮を禁止する
+    if (scope === "main" && seg.progressEndDate) {
+        if (type === "move" || type === "resize-left") {
+            dragType = "blocked";
+        } else if (type === "resize-right" && isMainFullyDone(seg)) {
+            dragType = "blocked";
+        }
     }
 
     // デフォルト動作(テキスト選択など)と伝播を阻止
@@ -2760,19 +3230,36 @@ function handleGlobalMouseUp(e) {
 
             } else if (dragState.type === "resize-right") {
                 const newEnd = shiftDateByVisibleColumns(dragState.originalEndDate, dayDelta);
-                const nextEnd = newEnd < seg.startDate ? seg.startDate : newEnd;
+                let nextEnd = newEnd < seg.startDate ? seg.startDate : newEnd;
+                if (dragState.scope === "main") {
+                    // コメントが収まらなくなる手前で止める（縮める方向のみ）
+                    const minEnd = minEndDateForMain(seg);
+                    if (nextEnd < minEnd) nextEnd = minEnd > seg.endDate ? seg.endDate : minEnd;
+                }
                 if (dragState.scope === "main" && hasOverlappingMainSchedule(task, seg.startDate, nextEnd, seg.id)) {
                     alert("メイン計画は重複して設定できません。");
                 } else {
+                    const previousEnd = seg.endDate;
                     seg.endDate = nextEnd;
+                    if (dragState.scope === "main") {
+                        layoutMainMilestones(seg, seg.startDate, previousEnd);
+                    }
                 }
             } else if (dragState.type === "resize-left") {
                 const newStart = shiftDateByVisibleColumns(dragState.originalStartDate, dayDelta);
-                const nextStart = newStart > seg.endDate ? seg.endDate : newStart;
+                let nextStart = newStart > seg.endDate ? seg.endDate : newStart;
+                if (dragState.scope === "main") {
+                    const maxStart = maxStartDateForMain(seg);
+                    if (nextStart > maxStart) nextStart = maxStart < seg.startDate ? seg.startDate : maxStart;
+                }
                 if (dragState.scope === "main" && hasOverlappingMainSchedule(task, nextStart, seg.endDate, seg.id)) {
                     alert("メイン計画は重複して設定できません。");
                 } else {
+                    const previousStart = seg.startDate;
                     seg.startDate = nextStart;
+                    if (dragState.scope === "main") {
+                        layoutMainMilestones(seg, previousStart, seg.endDate);
+                    }
                 }
             }
             triggerSave();
@@ -2999,6 +3486,7 @@ function showContextMenu(e, taskId) {
     else { hideBtn.style.display = "block"; unhideBtn.style.display = "none"; }
     
     segmentContextMenu.style.display = "none";
+    if (headerContextMenu) headerContextMenu.style.display = "none";
     contextMenu.style.display = "block";
     contextMenu.style.left = e.pageX + "px";
     contextMenu.style.top = e.pageY + "px";
@@ -3023,6 +3511,7 @@ function showSegmentContextMenu(e, task, seg) {
     
     contextMenu.style.display = "none";
     if (dependencyContextMenu) dependencyContextMenu.style.display = "none";
+    if (headerContextMenu) headerContextMenu.style.display = "none";
     segmentContextMenu.style.display = "block";
     segmentContextMenu.style.left = e.pageX + "px";
     segmentContextMenu.style.top = e.pageY + "px";
@@ -3038,7 +3527,13 @@ document.addEventListener("click", () => {
 
 document.getElementById("cmComplete").addEventListener("click", () => {
     const t = taskObjects.find(t => t.id === contextMenuTargetTaskId);
-    if (t) { t.isDone = !t.isDone; t.leftRowEl.classList.toggle("task-done", t.isDone); t.rowEl.classList.toggle("task-done", t.isDone); triggerSave(); }
+    if (t) {
+        t.isDone = !t.isDone;
+        t.leftRowEl.classList.toggle("task-done", t.isDone);
+        t.rowEl.classList.toggle("task-done", t.isDone);
+        scheduleProgressGuideRefresh();
+        triggerSave();
+    }
 });
 document.getElementById("cmHide").addEventListener("click", () => {
     const t = taskObjects.find(t => t.id === contextMenuTargetTaskId);
@@ -3093,6 +3588,25 @@ document.getElementById("ctxSegDelete").addEventListener("click", () => {
     }
 });
 
+document.getElementById("ctxHeaderAddLeft").addEventListener("click", () => {
+    if (contextMenuTargetHeaderIndex === null) return;
+    const index = contextMenuTargetHeaderIndex;
+    hideContextMenus();
+    addItemColumn(index);
+});
+document.getElementById("ctxHeaderAddRight").addEventListener("click", () => {
+    if (contextMenuTargetHeaderIndex === null) return;
+    const index = contextMenuTargetHeaderIndex + 1;
+    hideContextMenus();
+    addItemColumn(index);
+});
+document.getElementById("ctxHeaderDelete").addEventListener("click", () => {
+    if (contextMenuTargetHeaderIndex === null) return;
+    const index = contextMenuTargetHeaderIndex;
+    hideContextMenus();
+    removeItemColumn(index);
+});
+
 document.getElementById("ctxDependencyDelete").addEventListener("click", () => {
     if (!contextMenuTargetDependencyId) return;
     if (!confirm("この依存線を削除しますか？")) return;
@@ -3119,6 +3633,38 @@ if (collapseAllSubsBtn) {
 if (expandAllSubsBtn) {
     expandAllSubsBtn.addEventListener("click", () => setAllTaskSubSchedulesCollapsed(false));
 }
+if (memoToggleBtn) {
+    memoToggleBtn.addEventListener("click", () => {
+        setMemoCollapsed(!(appData.settings.memoCollapsed === true));
+    });
+}
+if (memoSplitter) {
+    memoSplitter.addEventListener("mousedown", (e) => {
+        if (e.button !== 0) return;
+        if (appData.settings.memoCollapsed === true) return;
+        e.preventDefault();
+        isResizingMemo = true;
+        memoResizeStartX = e.clientX;
+        memoResizeStartWidth = freeMemoArea.getBoundingClientRect().width;
+        memoSplitter.classList.add("dragging");
+        document.body.style.cursor = "col-resize";
+        document.body.style.userSelect = "none";
+    });
+    // ダブルクリックで既定の幅（全体の1/4）に戻す
+    memoSplitter.addEventListener("dblclick", () => {
+        if (appData.settings.memoCollapsed === true) return;
+        appData.settings.memoWidth = 0;
+        applyMemoWidth(0);
+        scheduleProgressGuideRefresh();
+        triggerSave();
+    });
+}
+// ウインドウの大きさが変わったら、はみ出さないように収め直す
+window.addEventListener("resize", () => {
+    if (!appData?.settings?.memoWidth) return;
+    applyMemoWidth(appData.settings.memoWidth);
+    scheduleProgressGuideRefresh();
+});
 if (toggleHolidaysBtn) {
     toggleHolidaysBtn.addEventListener("click", () => {
         appData.settings.hideHolidays = appData.settings.hideHolidays !== true;
@@ -3343,6 +3889,19 @@ function setupControlEvents() {
         reader.readAsText(file);
     });
 
+    const excelExportBtn = document.getElementById("excelExportBtn");
+    const excelImportBtn = document.getElementById("excelImportBtn");
+    const excelFileInput = document.getElementById("excelFileInput");
+    if (excelExportBtn) excelExportBtn.addEventListener("click", exportToExcel);
+    if (excelImportBtn && excelFileInput) {
+        excelImportBtn.addEventListener("click", () => { excelFileInput.click(); });
+        excelFileInput.addEventListener("change", (e) => {
+            const file = e.target.files[0];
+            excelFileInput.value = "";
+            if (file) importExcelFile(file);
+        });
+    }
+
     const rowSelectHeader = document.getElementById("rowSelectHeader");
     if (rowSelectHeader) {
         rowSelectHeader.textContent = "□";
@@ -3460,7 +4019,12 @@ function setupControlEvents() {
     }
 
     document.addEventListener("mousemove", (e) => {
-        if (isResizingCol) {
+        if (isResizingMemo) {
+            // 右へドラッグ＝メモ欄が狭くなる。0以下は「既定に戻す」の意味になるので下限で止める
+            const delta = memoResizeStartX - e.clientX;
+            applyMemoWidth(Math.max(MIN_MEMO_WIDTH, memoResizeStartWidth + delta));
+            scheduleProgressGuideRefresh();
+        } else if (isResizingCol) {
             const delta = e.clientX - resizeStartX;
             const newWidth = clampColumnWidth(resizeColIndex, resizeStartWidth + delta);
             leftColumnWidths[resizeColIndex] = newWidth;
@@ -3478,6 +4042,15 @@ function setupControlEvents() {
         }
     });
     document.addEventListener("mouseup", () => {
+        if (isResizingMemo) {
+            isResizingMemo = false;
+            memoSplitter.classList.remove("dragging");
+            document.body.style.cursor = "";
+            document.body.style.userSelect = "";
+            appData.settings.memoWidth = Math.round(freeMemoArea.getBoundingClientRect().width);
+            scheduleProgressGuideRefresh();
+            triggerSave();
+        }
         if (isResizingCol) {
             isResizingCol = false;
             resizeColIndex = null;
@@ -3539,7 +4112,7 @@ function handleMainCellClick(task, index) {
             return;
         }
 
-        task.mainSchedules.push({
+        const newMain = {
             id: "main_" + Date.now() + "_" + Math.random().toString(36).slice(2),
             startDate: s,
             endDate: e,
@@ -3548,10 +4121,24 @@ function handleMainCellClick(task, index) {
             endLabel: "",
             progressEndDate: null,
             milestones: []
-        });
+        };
+        task.mainSchedules.push(newMain);
         task.mainSchedules.sort((a, b) => a.startDate.localeCompare(b.startDate));
         renderAllSegments();
-        triggerSave();
+
+        setTimeout(() => {
+            const initialLabel = "メイン計画";
+            const inputLabel = prompt("計画内容を入力してください:", initialLabel);
+
+            if (inputLabel === null) {
+                task.mainSchedules = task.mainSchedules.filter(m => m.id !== newMain.id);
+                renderAllSegments();
+            } else {
+                newMain.label = (inputLabel.trim() === "") ? initialLabel : inputLabel.trim();
+                renderAllSegments();
+                triggerSave();
+            }
+        }, 10);
         return;
     }
 
@@ -3596,7 +4183,7 @@ function updateTodoTable(dateObj) {
         "40px",  // 選択
         "15%",   // 項目1
         "15%",   // 項目2
-        "80px",  // 時間
+        "80px",  // 担当
         "auto",  // 実施内容
         "70px",  // 計画
         "70px"   // 実績
@@ -3788,7 +4375,7 @@ function exportTodoToOutlookCSV() {
     const items = [];
     taskObjects.forEach(task => {
         if (task.isHidden) return;
-        const t1 = task.leftRowEl.children[1].querySelector(".editable").textContent;
+        const t1 = (getTaskLabelEditables(task)[0] || {}).textContent || "";
         task.segments.forEach(seg => {
             if (seg.startDate <= iso && seg.endDate >= iso) {
                 items.push({
@@ -3849,8 +4436,9 @@ function exportTodoToCSV() {
     const columnsRaw = document.getElementById("todoColumnsInput").value || "";
     let columns = columnsRaw.split(",").map(s => s.trim()).filter(Boolean);
     if (columns.length === 0) {
-        columns = DEFAULT_TODO_COLUMNS.split(",").map(s => s.trim());
+        columns = getDefaultTodoColumns().split(",").map(s => s.trim());
     }
+    columns = normalizeTodoColumns(columns);
 
     const headers = columns.map(c => '"' + c.replace(/"/g, '""') + '"');
     const iso = dateToISO(currentTodoDate);
@@ -3874,7 +4462,7 @@ function exportTodoToCSV() {
             let v = "";
             if (col === "項目1") v = t1;
             else if (col === "項目2") v = t2;
-            else if (col === "時間") v = t3;
+            else if (col === "担当") v = t3;
             else if (col === "実施内容") v = desc;
             else if (col === "計画") v = plan;
             else if (col === "実績") v = actual;
@@ -3926,6 +4514,472 @@ function downloadAsShiftJIS(content, filename) {
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+}
+
+// ============================================
+// Excel入出力
+// ============================================
+// 「表示されている日」か（休日非表示のときは土日・会社休日を除く）
+// settings を省略すると現在の計画の設定を使う（インポート時は読込先の計画の設定を渡す）
+function isVisibleDay(iso, settings = appData.settings) {
+    if (settings.hideHolidays !== true) return true;
+    const dow = isoToDate(iso).getDay();
+    if (dow === 0 || dow === 6) return false;
+    return !(settings.holidays || []).includes(iso);
+}
+
+// 期間内で表示されている日の一覧。全日非表示なら暦日で返す
+function listVisibleDays(startIso, endIso, settings = appData.settings) {
+    const s = startIso <= endIso ? startIso : endIso;
+    const e = startIso <= endIso ? endIso : startIso;
+    const all = [];
+    const visible = [];
+    const cur = isoToDate(s);
+    const end = isoToDate(e);
+    let guard = 0;
+    while (cur <= end && guard < 5000) {
+        const iso = dateToISO(cur);
+        all.push(iso);
+        if (isVisibleDay(iso, settings)) visible.push(iso);
+        cur.setDate(cur.getDate() + 1);
+        guard++;
+    }
+    return visible.length > 0 ? visible : all;
+}
+
+// 進捗日 -> 1〜10 の段階（表示日数に対する消化日数の割合）
+function progressToScale(startIso, endIso, progressIso) {
+    if (!progressIso) return null;
+    const days = listVisibleDays(startIso, endIso);
+    const done = days.filter(iso => iso <= progressIso).length;
+    if (done <= 0) return null;
+    return Math.max(1, Math.min(10, Math.round((done / days.length) * 10)));
+}
+
+// 1〜10 の段階 -> 進捗日
+function scaleToProgressIso(startIso, endIso, scale, settings = appData.settings) {
+    const n = Number(scale);
+    if (!Number.isFinite(n) || n <= 0) return null;
+    const days = listVisibleDays(startIso, endIso, settings);
+    const count = Math.max(1, Math.min(days.length, Math.round((Math.min(n, 10) / 10) * days.length)));
+    return days[count - 1];
+}
+
+function isValidIso(iso) {
+    if (typeof iso !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(iso)) return false;
+    return dateToISO(isoToDate(iso)) === iso;
+}
+
+// Excelセルの値（日付型・シリアル値・文字列）を YYYY-MM-DD に変換
+function excelCellToIso(value, settings = appData.settings) {
+    if (value == null || value === "") return null;
+    if (value instanceof Date) {
+        if (Number.isNaN(value.getTime())) return null;
+        return dateToISO(value);
+    }
+    if (typeof value === "number") {
+        const parsed = XLSX.SSF.parse_date_code(value);
+        if (!parsed) return null;
+        const iso = `${parsed.y}-${pad2(parsed.m)}-${pad2(parsed.d)}`;
+        return isValidIso(iso) ? iso : null;
+    }
+    const text = String(value).trim();
+    let m = text.match(/^(\d{4})[\/\-.年](\d{1,2})[\/\-.月](\d{1,2})/);
+    if (m) {
+        const iso = `${m[1]}-${pad2(Number(m[2]))}-${pad2(Number(m[3]))}`;
+        return isValidIso(iso) ? iso : null;
+    }
+    m = text.match(/^(\d{1,2})[\/\-.月](\d{1,2})日?$/);
+    if (m) {
+        const year = isoToDate(settings.startDate).getFullYear();
+        const iso = `${year}-${pad2(Number(m[1]))}-${pad2(Number(m[2]))}`;
+        return isValidIso(iso) ? iso : null;
+    }
+    return null;
+}
+
+function excelDate(iso) {
+    return iso ? isoToDate(iso) : "";
+}
+
+function cellText(value) {
+    if (value == null) return "";
+    return String(value).trim();
+}
+
+// 「日程表：202606.xlsx」-> 「202606」
+function planNameFromExcelFileName(fileName) {
+    let name = String(fileName || "").replace(/\.xlsx$/i, "");
+    name = name.replace(/^日程表[：:]/, "").trim();
+    return name;
+}
+
+// ---- エクスポート ----
+// 行ごとの列構成: 項目列の並びに「項目1メモ」を差し込む（2列目の後ろ。項目列が1つなら1列目の後ろ）
+function buildExcelTaskColumns(headers) {
+    const cols = headers.map((name, index) => ({ kind: "item", index, name }));
+    cols.splice(Math.min(2, headers.length), 0, { kind: "memo", name: EXCEL_COL.memo });
+    return cols;
+}
+
+function buildExcelPlanRows() {
+    const headers = getHeaderTexts();
+    const taskColumns = buildExcelTaskColumns(headers);
+    const rows = [[
+        EXCEL_COL.done, EXCEL_COL.hidden, ...taskColumns.map(c => c.name),
+        EXCEL_COL.type, EXCEL_COL.comment, EXCEL_COL.start, EXCEL_COL.end, EXCEL_COL.progress
+    ]];
+    const blankTaskCols = () => ["", "", ...taskColumns.map(() => "")];
+
+    taskObjects.forEach(task => {
+        const scheduleRows = [];
+
+        [...(task.mainSchedules || [])]
+            .sort((a, b) => a.startDate.localeCompare(b.startDate))
+            .forEach(main => {
+                const days = listVisibleDays(main.startDate, main.endDate);
+                const milestones = [...(main.milestones || [])].sort((a, b) => a.date.localeCompare(b.date));
+                const startMs = milestones.find(ms => ms.date === main.startDate) || null;
+                const endMs = (main.endDate !== main.startDate)
+                    ? (milestones.find(ms => ms.date === main.endDate) || null)
+                    : null;
+                scheduleRows.push([
+                    EXCEL_TYPE.mainAll, main.label || "",
+                    excelDate(days[0]), excelDate(days[days.length - 1]),
+                    progressToScale(main.startDate, main.endDate, main.progressEndDate)
+                ]);
+                // 開始日・終了日のマイルストーンは M始/M終 として出力（無ければ端点コメント）
+                scheduleRows.push([EXCEL_TYPE.mainStart, startMs ? (startMs.label || "") : (main.startLabel || ""), "", "", null]);
+                scheduleRows.push([EXCEL_TYPE.mainEnd, endMs ? (endMs.label || "") : (main.endLabel || ""), "", "", null]);
+                milestones
+                    .filter(ms => ms !== startMs && ms !== endMs)
+                    .forEach(ms => {
+                        scheduleRows.push([EXCEL_TYPE.milestone, ms.label || "", excelDate(ms.date), excelDate(ms.date), null]);
+                    });
+            });
+
+        [...(task.segments || [])]
+            .sort((a, b) => (a.startDate !== b.startDate)
+                ? a.startDate.localeCompare(b.startDate)
+                : (a.endDate || a.startDate).localeCompare(b.endDate || b.startDate))
+            .forEach(seg => {
+                const endIso = seg.endDate || seg.startDate;
+                const days = listVisibleDays(seg.startDate, endIso);
+                scheduleRows.push([
+                    EXCEL_TYPE.sub, seg.label || "",
+                    excelDate(days[0]), excelDate(days[days.length - 1]),
+                    progressToScale(seg.startDate, endIso, seg.progressEndDate)
+                ]);
+            });
+
+        if (scheduleRows.length === 0) scheduleRows.push(["", "", "", "", null]);
+
+        const labels = getTaskLabels(task);
+        scheduleRows.forEach((scheduleRow, index) => {
+            const taskCols = index === 0
+                ? [
+                    task.isDone ? EXCEL_COL.done : "",
+                    task.isHidden ? EXCEL_COL.hidden : "",
+                    ...taskColumns.map(c => (c.kind === "item" ? (labels[c.index] || "") : (task.memo || "")))
+                ]
+                : blankTaskCols();
+            rows.push([...taskCols, ...scheduleRow]);
+        });
+    });
+    return rows;
+}
+
+// メモ・備考: 1行 = 1行、タブ = 列
+function buildExcelMemoRows() {
+    const text = getFreeMemoText();
+    if (!text) return [];
+    return text.split(/\r?\n/).map(line => line.split("\t").map(cell => {
+        const trimmed = cell.replace(/^[\s\u3000]+|[\s\u3000]+$/g, "");
+        if (trimmed === "") return null;
+        if (/^-?\d+(\.\d+)?$/.test(trimmed)) return Number(trimmed);
+        return trimmed;
+    }));
+}
+
+function buildExcelWorkbook() {
+    syncDataModel();
+
+    const headers = getHeaderTexts();
+    const planRows = buildExcelPlanRows().map(row => row.map(v => (v === "" ? null : v)));
+    const wsPlan = XLSX.utils.aoa_to_sheet(planRows, { cellDates: true });
+    Object.keys(wsPlan).forEach(key => {
+        if (key[0] !== "!" && wsPlan[key].t === "d") wsPlan[key].z = "yyyy/m/d";
+    });
+    wsPlan["!cols"] = [
+        { wch: 4 }, { wch: 8 },
+        ...buildExcelTaskColumns(headers).map(c => ({ wch: c.kind === "memo" ? 18 : 16 })),
+        { wch: 7 }, { wch: 20 }, { wch: 12 }, { wch: 12 }, { wch: 11 }
+    ];
+
+    const memoRows = buildExcelMemoRows();
+    const wsMemo = XLSX.utils.aoa_to_sheet(memoRows.length > 0 ? memoRows : [[null]]);
+    wsMemo["!cols"] = [{ wch: 30 }];
+
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, wsPlan, EXCEL_SHEET_PLAN);
+    XLSX.utils.book_append_sheet(wb, wsMemo, EXCEL_SHEET_MEMO);
+    return wb;
+}
+
+function exportToExcel() {
+    if (typeof XLSX === "undefined") {
+        alert("Excel出力ライブラリ (vendor/xlsx.full.min.js) が読み込まれていません。");
+        return;
+    }
+    const wb = buildExcelWorkbook();
+    const safeName = (appData.projectName || "schedule").replace(/[\\/:*?"<>|]/g, "_");
+    XLSX.writeFile(wb, `${EXCEL_FILE_PREFIX}${safeName}.xlsx`);
+}
+
+// ---- インポート ----
+// ワークブック -> 計画データ（restoreFromData に渡せる形）
+// basePlan: 期間・休日・列幅などを引き継ぐ元の計画データ（読込先の計画。無ければ現在の計画）
+function parseExcelWorkbook(wb, fileName, basePlan = appData) {
+    const baseSettings = basePlan.settings || appData.settings;
+    const planSheet = wb.Sheets[EXCEL_SHEET_PLAN] || wb.Sheets[wb.SheetNames[0]];
+    if (!planSheet) throw new Error("「計画」シートが見つかりません。");
+
+    const rows = XLSX.utils.sheet_to_json(planSheet, { header: 1, raw: true, defval: null });
+    const headerRow = (rows[0] || []).map(cellText);
+    const col = {};
+    Object.entries(EXCEL_COL).forEach(([key, name]) => { col[key] = headerRow.indexOf(name); });
+    if (col.type < 0) throw new Error(`1行目に「${EXCEL_COL.type}」列が見つかりません。`);
+
+    // 項目列 = 「完」「非表示」の右から「M/S」の左まで（「項目1メモ」列は除く）
+    const firstItemCol = Math.max(col.done, col.hidden) + 1;
+    const itemCols = [];
+    for (let c = firstItemCol; c < col.type; c++) {
+        if (c !== col.memo) itemCols.push(c);
+    }
+    if (itemCols.length === 0) throw new Error("項目列が見つかりません（「非表示」と「M/S」の間に項目列を置いてください）。");
+    if (itemCols.length > MAX_ITEM_COLUMNS) throw new Error(`項目列は最大${MAX_ITEM_COLUMNS}列までです（${itemCols.length}列あります）。`);
+    const headers = normalizeHeaders(itemCols.map(c => headerRow[c]));
+
+    const tasks = [];
+    let currentTask = null;
+    let currentMain = null;
+    const warnings = [];
+    let minIso = null;
+    let maxIso = null;
+    const noteDate = (iso) => {
+        if (!iso) return;
+        if (!minIso || iso < minIso) minIso = iso;
+        if (!maxIso || iso > maxIso) maxIso = iso;
+    };
+    const readCell = (row, index) => (index >= 0 ? row[index] : null);
+
+    for (let r = 1; r < rows.length; r++) {
+        const row = rows[r] || [];
+        const excelRowNo = r + 1;
+        const doneText = cellText(readCell(row, col.done));
+        const hiddenText = cellText(readCell(row, col.hidden));
+        const labels = itemCols.map(c => cellText(row[c]));
+        // 行メモは改行を含み得るので trim しない
+        const memoValue = readCell(row, col.memo);
+        const memoText = memoValue == null ? "" : String(memoValue);
+        const startsTask = doneText !== "" || hiddenText !== "" || memoText.trim() !== "" || labels.some(v => v !== "");
+
+        if (startsTask || !currentTask) {
+            if (tasks.length >= MAX_PLAN_TASKS) {
+                warnings.push(`行数が上限(${MAX_PLAN_TASKS})を超えたため、${excelRowNo}行目以降は読み込みませんでした。`);
+                break;
+            }
+            currentTask = {
+                id: "task_" + Date.now() + "_" + Math.random().toString(36).slice(2) + "_" + r,
+                labels,
+                mainSchedules: [],
+                segments: [],
+                memo: memoText,
+                customHeight: 0,
+                isDone: doneText !== "",
+                isHidden: hiddenText !== "",
+                isSubCollapsed: false
+            };
+            tasks.push(currentTask);
+            currentMain = null;
+        }
+
+        const type = cellText(readCell(row, col.type));
+        if (type === "") continue;
+        const comment = cellText(readCell(row, col.comment));
+        const startIso = excelCellToIso(readCell(row, col.start), baseSettings);
+        const endIso = excelCellToIso(readCell(row, col.end), baseSettings) || startIso;
+        const progress = readCell(row, col.progress);
+
+        if (type === EXCEL_TYPE.mainAll) {
+            if (!startIso) { warnings.push(`${excelRowNo}行目: M全の開始予定が読めないため飛ばしました。`); currentMain = null; continue; }
+            const sIso = startIso <= endIso ? startIso : endIso;
+            const eIso = startIso <= endIso ? endIso : startIso;
+            const overlaps = currentTask.mainSchedules.some(m => !(eIso < m.startDate || sIso > m.endDate));
+            if (overlaps) { warnings.push(`${excelRowNo}行目: メイン計画「${comment}」が同じ行の別のメイン計画と重なるため飛ばしました。`); currentMain = null; continue; }
+            currentMain = {
+                id: "main_" + Date.now() + "_" + Math.random().toString(36).slice(2) + "_" + r,
+                startDate: sIso, endDate: eIso,
+                label: comment, startLabel: "", endLabel: "",
+                progressEndDate: scaleToProgressIso(sIso, eIso, progress, baseSettings),
+                milestones: []
+            };
+            currentTask.mainSchedules.push(currentMain);
+            noteDate(sIso); noteDate(eIso);
+        } else if (type === EXCEL_TYPE.mainStart || type === EXCEL_TYPE.mainEnd || type === EXCEL_TYPE.milestone) {
+            if (!currentMain) {
+                if (comment !== "") warnings.push(`${excelRowNo}行目: 直前にM全が無いため「${comment}」を飛ばしました。`);
+                continue;
+            }
+            let msIso = null;
+            if (type === EXCEL_TYPE.mainStart) msIso = currentMain.startDate;
+            else if (type === EXCEL_TYPE.mainEnd) msIso = currentMain.endDate;
+            else msIso = startIso;
+            if (type !== EXCEL_TYPE.milestone && comment === "") continue;  // M始/M終 の空欄は「無し」
+            if (!msIso) { warnings.push(`${excelRowNo}行目: マイルストーンの日付が読めないため飛ばしました。`); continue; }
+            if (msIso < currentMain.startDate || msIso > currentMain.endDate) {
+                warnings.push(`${excelRowNo}行目: マイルストーン「${comment}」がメイン計画の期間外のため飛ばしました。`);
+                continue;
+            }
+            if (currentMain.milestones.some(ms => ms.date === msIso)) continue;
+            currentMain.milestones.push({
+                id: "ms_" + Date.now() + "_" + Math.random().toString(36).slice(2) + "_" + r,
+                date: msIso,
+                label: comment || "マイルストーン"
+            });
+        } else if (type === EXCEL_TYPE.sub) {
+            if (!startIso) { warnings.push(`${excelRowNo}行目: Sの開始予定が読めないため飛ばしました。`); continue; }
+            const sIso = startIso <= endIso ? startIso : endIso;
+            const eIso = startIso <= endIso ? endIso : startIso;
+            if (currentTask.segments.length >= MAX_TASK_SEGMENTS) { warnings.push(`${excelRowNo}行目: サブ計画が上限(${MAX_TASK_SEGMENTS})を超えたため飛ばしました。`); continue; }
+            currentTask.segments.push({
+                id: "seg_" + Date.now() + "_" + Math.random().toString(36).slice(2) + "_" + r,
+                startDate: sIso, endDate: eIso, type: "range",
+                label: comment,
+                progressEndDate: scaleToProgressIso(sIso, eIso, progress, baseSettings),
+                dailyValues: {}, dailyResults: {}
+            });
+            noteDate(sIso); noteDate(eIso);
+        } else {
+            warnings.push(`${excelRowNo}行目: M/S「${type}」は不明な種別のため飛ばしました。`);
+        }
+    }
+    tasks.forEach(t => t.mainSchedules.sort((a, b) => a.startDate.localeCompare(b.startDate)));
+
+    // メモ・備考シート
+    let memo = "";
+    const memoSheet = wb.Sheets[EXCEL_SHEET_MEMO];
+    if (memoSheet) {
+        const memoRows = XLSX.utils.sheet_to_json(memoSheet, { header: 1, raw: true, defval: null });
+        memo = memoRows.map(row => {
+            const cells = (row || []).map(v => (v == null ? "" : String(v)));
+            while (cells.length > 0 && cells[cells.length - 1] === "") cells.pop();
+            return cells.join("\t");
+        }).join("\n");
+    }
+
+    // 期間: 読込先の計画の設定を引き継ぎ、読み込んだ日付を含むように広げる
+    const settings = { ...baseSettings, holidays: [...(baseSettings.holidays || [])] };
+    if (minIso && minIso < settings.startDate) {
+        const d = isoToDate(minIso);
+        settings.startDate = dateToISO(new Date(d.getFullYear(), d.getMonth(), 1));
+    }
+    if (maxIso && maxIso > settings.endDate) {
+        const d = isoToDate(maxIso);
+        settings.endDate = dateToISO(new Date(d.getFullYear(), d.getMonth() + 1, 0));
+    }
+
+    const baseHeaders = normalizeHeaders(basePlan.headers);
+    const keepWidths = baseHeaders.length === headers.length;
+    const planName = planNameFromExcelFileName(fileName) || basePlan.projectName || "標準の計画";
+
+    return {
+        data: {
+            projectName: planName,
+            memoFormat: "plain",
+            settings,
+            headers,
+            todoColumns: getDefaultTodoColumns(headers),
+            columnWidths: keepWidths
+                ? normalizeColumnWidths(basePlan.columnWidths, headers.length)
+                : normalizeColumnWidths([], headers.length),
+            dependencies: [],
+            tasks,
+            memo,
+            memoHeight: basePlan.memoHeight || DEFAULT_FREE_MEMO_HEIGHT
+        },
+        warnings
+    };
+}
+
+function importExcelFile(file) {
+    if (typeof XLSX === "undefined") {
+        alert("Excel読込ライブラリ (vendor/xlsx.full.min.js) が読み込まれていません。");
+        return;
+    }
+    if (file.size > MAX_IMPORT_FILE_BYTES) {
+        alert(`ファイルサイズが大きすぎます。${Math.floor(MAX_IMPORT_FILE_BYTES / (1024 * 1024))}MB 以下の Excel を読み込んでください。`);
+        return;
+    }
+    const reader = new FileReader();
+    reader.onload = async (evt) => {
+        // 読込先の計画はファイル名（日程表：B.xlsx -> B）で決める
+        syncDataModel();
+        updateCurrentPlanEntryFromAppData();
+        const planName = planNameFromExcelFileName(file.name);
+        if (!planName) {
+            alert("ファイル名から日程表の名前を判断できません。\n「日程表：<名前>.xlsx」の形式で保存してください。");
+            return;
+        }
+        const existingEntry = appStore.plans.find(plan => plan.name === planName) || null;
+        const basePlan = existingEntry ? existingEntry.data : appData;
+
+        let parsed;
+        try {
+            const wb = XLSX.read(new Uint8Array(evt.target.result), { type: "array", cellDates: false });
+            parsed = parseExcelWorkbook(wb, file.name, basePlan);
+        } catch (err) {
+            alert("Excelの読込に失敗しました。\n" + (err && err.message ? err.message : ""));
+            return;
+        }
+        const validated = sanitizeImportedPlanData(parsed.data);
+        validated.projectName = planName;
+        const taskCount = validated.tasks.length;
+
+        let targetEntry;
+        if (existingEntry) {
+            if (!confirm(`日程表「${planName}」は既にあります。\n${taskCount} 行を読み込んで上書きしてよろしいですか？`)) return;
+            existingEntry.name = planName;
+            existingEntry.data = clonePlanData(validated);
+            targetEntry = existingEntry;
+        } else {
+            if (!confirm(`日程表「${planName}」は無いため、新しく作成して ${taskCount} 行を読み込みます。\nよろしいですか？`)) return;
+            targetEntry = createPlanEntry(planName, validated);
+            appStore.plans.push(targetEntry);
+        }
+
+        currentPlanId = targetEntry.id;
+        appStore.currentPlanId = targetEntry.id;
+        refreshPlanSelect();
+        restoreFromData(clonePlanData(targetEntry.data));
+        activeTaskId = null;
+        activeProgressSegmentId = null;
+        HistoryManager.init(appData);
+        await persistStore();
+        requestAnimationFrame(() => requestAnimationFrame(scrollToToday));
+
+        let message = existingEntry
+            ? `完了: 日程表「${planName}」を上書きしました（${taskCount} 行）。`
+            : `完了: 日程表「${planName}」を新しく作成しました（${taskCount} 行）。`;
+        if (parsed.warnings.length > 0) {
+            const shown = parsed.warnings.slice(0, 10);
+            message += `\n\n注意 (${parsed.warnings.length}件):\n・` + shown.join("\n・");
+            if (parsed.warnings.length > shown.length) message += `\n・…ほか ${parsed.warnings.length - shown.length} 件`;
+        }
+        alert(message);
+    };
+    reader.onerror = () => alert("ファイルを読み込めませんでした。");
+    reader.readAsArrayBuffer(file);
 }
 
 function ensureTodoDateControlLayout() {
@@ -4027,34 +5081,28 @@ function updateTodoTable(dateObj) {
     const columnsRaw = columnsInput ? columnsInput.value : "";
     let displayCols = columnsRaw.split(",").map(s => s.trim()).filter(Boolean);
     if (displayCols.length === 0) {
-        displayCols = DEFAULT_TODO_COLUMNS.split(",").map(s => s.trim());
+        displayCols = getDefaultTodoColumns(itemHeaders).split(",").map(s => s.trim());
     }
+    const itemHeaders = getHeaderTexts();
+    displayCols = normalizeTodoColumns(displayCols, itemHeaders);
     displayCols = displayCols.filter(col => col !== "メモ");
-    const requiredTodoCols = ["項目1", "項目2", "時間", "実施内容", "計画", "実績"];
+    const requiredTodoCols = [...itemHeaders, "実施内容", "計画", "実績"];
     requiredTodoCols.forEach(col => {
         if (!displayCols.includes(col)) displayCols.push(col);
     });
 
-    const colKeys = displayCols.map(col => {
-        if (col === "項目1") return "h1";
-        if (col === "項目2") return "h2";
-        if (col === "時間") return "h3";
-        if (col === "実施内容") return "desc";
-        if (col === "計画") return "plan";
-        if (col === "実績") return "actual";
-        if (col === "メモ") return "memo";
-        return "unknown";
-    });
+    const colKeys = displayCols.map(col => todoColumnKey(col, itemHeaders));
     const colWidths = {
-        h1: "90px",
-        h2: "150px",
-        h3: "90px",
         desc: "120px",
         plan: "70px",
         actual: "70px",
         memo: "100px",
         unknown: "100px"
     };
+    const itemColWidth = (idx) => (idx === 0 ? "90px" : (idx === 1 ? "150px" : "90px"));
+    const widthOf = (key) => key.startsWith("item:")
+        ? itemColWidth(Number(key.slice(5)))
+        : (colWidths[key] || colWidths.unknown);
 
     table.style.tableLayout = "fixed";
     table.style.width = "100%";
@@ -4063,7 +5111,7 @@ function updateTodoTable(dateObj) {
     displayCols.forEach((colName, idx) => {
         const th = document.createElement("th");
         th.textContent = colName;
-        th.style.width = colWidths[colKeys[idx]] || colWidths.unknown;
+        th.style.width = widthOf(colKeys[idx]);
         trH.appendChild(th);
     });
     thead.appendChild(trH);
@@ -4078,12 +5126,7 @@ function updateTodoTable(dateObj) {
     taskObjects.forEach(task => {
         if (task.isHidden) return;
 
-        const editable1 = task.leftRowEl.children[1].querySelector(".editable");
-        const editable2 = task.leftRowEl.children[2].querySelector(".editable");
-        const editable3 = task.leftRowEl.children[3].querySelector(".editable");
-        const t1 = editable1 ? editable1.textContent : "";
-        const t2 = editable2 ? editable2.textContent : "";
-        const t3 = editable3 ? editable3.textContent : "";
+        const itemEditables = getTaskLabelEditables(task);
         const activeSegments = task.segments.filter(seg => seg.startDate <= iso && seg.endDate >= iso);
         const rowDefs = activeSegments.length
             ? activeSegments.map(seg => ({ seg, hasTask: true }))
@@ -4101,7 +5144,7 @@ function updateTodoTable(dateObj) {
 
             colKeys.forEach((key) => {
                 const td = document.createElement("td");
-                td.style.width = colWidths[key] || colWidths.unknown;
+                td.style.width = widthOf(key);
 
                 const input = document.createElement("input");
                 let val = "";
@@ -4109,31 +5152,17 @@ function updateTodoTable(dateObj) {
                 input.style.width = "100%";
                 input.style.boxSizing = "border-box";
 
-                if (key === "h1") {
-                    val = t1;
-                    isEditable = !!editable1;
-                    if (editable1) {
-                        input.addEventListener("change", (e) => {
-                            editable1.textContent = e.target.value;
-                            triggerSave();
-                        });
-                    }
-                } else if (key === "h2") {
-                    val = hasTask ? t2 : "";
-                    if (hasTask && editable2) {
+                if (key.startsWith("item:")) {
+                    const itemIndex = Number(key.slice(5));
+                    const editable = itemEditables[itemIndex];
+                    // 1列目は予定が無い行でも表示・編集できる（従来どおり）
+                    const available = editable && (itemIndex === 0 || hasTask);
+                    val = available ? editable.textContent : "";
+                    if (itemIndex >= 2) input.style.textAlign = "center";
+                    if (available) {
                         isEditable = true;
                         input.addEventListener("change", (e) => {
-                            editable2.textContent = e.target.value;
-                            triggerSave();
-                        });
-                    }
-                } else if (key === "h3") {
-                    val = hasTask ? t3 : "";
-                    input.style.textAlign = "center";
-                    if (hasTask && editable3) {
-                        isEditable = true;
-                        input.addEventListener("change", (e) => {
-                            editable3.textContent = e.target.value;
+                            editable.textContent = e.target.value;
                             triggerSave();
                         });
                     }
@@ -4236,8 +5265,9 @@ function exportTodoToCSV() {
     const columnsRaw = document.getElementById("todoColumnsInput").value || "";
     let columns = columnsRaw.split(",").map(s => s.trim()).filter(Boolean);
     if (columns.length === 0) {
-        columns = DEFAULT_TODO_COLUMNS.split(",").map(s => s.trim());
+        columns = getDefaultTodoColumns().split(",").map(s => s.trim());
     }
+    columns = normalizeTodoColumns(columns);
 
     const headers = columns.map(c => '"' + c.replace(/"/g, '""') + '"');
     const iso = dateToISO(currentTodoDate);
@@ -4250,23 +5280,23 @@ function exportTodoToCSV() {
         const seg = task ? task.segments.find(s => s.id === segId) : null;
         const hasTask = !!seg;
 
-        const t1 = task ? task.leftRowEl.children[1].querySelector(".editable").textContent : "";
-        const t2 = hasTask && task ? task.leftRowEl.children[2].querySelector(".editable").textContent : "";
-        const t3 = hasTask && task ? task.leftRowEl.children[3].querySelector(".editable").textContent : "";
+        const itemValues = task ? getTaskLabels(task) : [];
         const desc = hasTask && seg ? (seg.label || "") : "";
         const plan = hasTask && seg && seg.dailyValues ? (seg.dailyValues[iso] || "") : "";
         const actual = hasTask && seg && seg.dailyResults ? (seg.dailyResults[iso] || "") : "";
         const memo = hasTask && task ? (task.memo || "") : "";
 
         const rowData = columns.map(col => {
+            const key = todoColumnKey(col);
             let v = "";
-            if (col === "項目1") v = t1;
-            else if (col === "項目2") v = t2;
-            else if (col === "時間") v = t3;
-            else if (col === "実施内容") v = desc;
-            else if (col === "計画") v = plan;
-            else if (col === "実績") v = actual;
-            else if (col === "メモ") v = memo;
+            if (key.startsWith("item:")) {
+                const i = Number(key.slice(5));
+                v = (i === 0 || hasTask) ? (itemValues[i] || "") : "";
+            }
+            else if (key === "desc") v = desc;
+            else if (key === "plan") v = plan;
+            else if (key === "actual") v = actual;
+            else if (key === "memo") v = memo;
             return '"' + String(v).replace(/"/g, '""') + '"';
         });
         rows.push(rowData.join(","));

@@ -1890,6 +1890,25 @@ function getVisibleTaskRows() {
     return taskObjects.filter(task => task.rowEl && task.rowEl.offsetParent !== null);
 }
 
+// 実績バーの右端（＝どこまで進んだか）の座標
+function getMainProgressEdgePoint(task, main, overlayRect) {
+    const el = task.segLayerEl.querySelector(`[data-guide-role="main-progress"][data-main-id="${main.id}"]`);
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    return { x: rect.right - overlayRect.left, y: rect.top + (rect.height / 2) - overlayRect.top };
+}
+
+// メイン計画のバーの端の座標（side: "start" | "end"）
+function getMainBaseEdgePoint(task, main, overlayRect, side) {
+    const el = task.segLayerEl.querySelector(`[data-guide-role="main-base"][data-main-id="${main.id}"]`);
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    return {
+        x: (side === "end" ? rect.right : rect.left) - overlayRect.left,
+        y: rect.top + (rect.height / 2) - overlayRect.top
+    };
+}
+
 function getGuideAnchorPoint(task, overlayRect) {
     // 完了にした行は、実際の進捗に関わらず完了扱いとして縦に引く
     if (task.isDone) return null;
@@ -1897,35 +1916,45 @@ function getGuideAnchorPoint(task, overlayRect) {
     const mainSchedules = [...(task.mainSchedules || [])]
         .sort((a, b) => a.startDate.localeCompare(b.startDate));
 
+    // まだ終わっていない最初のメイン計画
     const targetMain = mainSchedules.find(main => {
         if (!main.progressEndDate) return true;
         return main.progressEndDate < main.endDate;
     });
-    if (!targetMain) return null;
 
+    // 実績が今日より先まで進んでいる場合だけ、その先端に合わせる。
+    // 今日より手前で終わっているものは「遅れ」ではないので、縦のままにする。
+    const aheadPoint = (main) => {
+        if (!main || !main.progressEndDate || main.progressEndDate <= todayISO) return null;
+        return getMainProgressEdgePoint(task, main, overlayRect)
+            || getMainBaseEdgePoint(task, main, overlayRect, "end");
+    };
+
+    // すべて終わっている場合は、いちばん先まで進んでいる実績の先端に合わせる
+    if (!targetMain) {
+        const furthest = mainSchedules.reduce((acc, main) =>
+            (!acc || (main.progressEndDate || "") > (acc.progressEndDate || "")) ? main : acc, null);
+        return aheadPoint(furthest);
+    }
+
+    // 進捗があるなら、着手時期の前後にかかわらずその先端に合わせる
+    if (targetMain.progressEndDate) {
+        const p = getMainProgressEdgePoint(task, targetMain, overlayRect);
+        if (p) return p;
+    }
+
+    // 進捗がまだ無く、着手時期も来ていない場合。
+    // 手前に今日より先まで終えた計画があれば、そこに合わせる
     if (targetMain.startDate > todayISO) {
+        const before = mainSchedules.slice(0, mainSchedules.indexOf(targetMain));
+        for (let i = before.length - 1; i >= 0; i--) {
+            const p = aheadPoint(before[i]);
+            if (p) return p;
+        }
         return null;
     }
 
-    if (targetMain.progressEndDate) {
-        const progressEl = task.segLayerEl.querySelector(`[data-guide-role="main-progress"][data-main-id="${targetMain.id}"]`);
-        if (progressEl) {
-            const rect = progressEl.getBoundingClientRect();
-            return {
-                x: rect.right - overlayRect.left,
-                y: rect.top + (rect.height / 2) - overlayRect.top
-            };
-        }
-    }
-
-    const mainEl = task.segLayerEl.querySelector(`[data-guide-role="main-base"][data-main-id="${targetMain.id}"]`);
-    if (!mainEl) return null;
-
-    const rect = mainEl.getBoundingClientRect();
-    return {
-        x: rect.left - overlayRect.left,
-        y: rect.top + (rect.height / 2) - overlayRect.top
-    };
+    return getMainBaseEdgePoint(task, targetMain, overlayRect, "start");
 }
 
 function appendGuideForTask(commands, task, overlayRect, boundaryX, previousPoint, isFirstTask = false) {
@@ -4607,11 +4636,13 @@ function cellText(value) {
     return String(value).trim();
 }
 
-// 「日程表：202606.xlsx」-> 「202606」
+// 「日程表：202606_202609122224.xlsx」-> 「202606」
+// 先頭の「日程表：」と、末尾に付けた出力日時（_YYYYMMDDHHMM）を取り除く
 function planNameFromExcelFileName(fileName) {
     let name = String(fileName || "").replace(/\.xlsx$/i, "");
-    name = name.replace(/^日程表[：:]/, "").trim();
-    return name;
+    name = name.replace(/^日程表[：:]/, "");
+    name = name.replace(/_\d{12}$/, "");
+    return name.trim();
 }
 
 // ---- エクスポート ----
@@ -4733,7 +4764,8 @@ function exportToExcel() {
     }
     const wb = buildExcelWorkbook();
     const safeName = (appData.projectName || "schedule").replace(/[\\/:*?"<>|]/g, "_");
-    XLSX.writeFile(wb, `${EXCEL_FILE_PREFIX}${safeName}.xlsx`);
+    // 日程表：<計画名>_YYYYMMDDHHMM.xlsx
+    XLSX.writeFile(wb, `${EXCEL_FILE_PREFIX}${safeName}_${formatTimestamp(new Date())}.xlsx`);
 }
 
 // ---- インポート ----

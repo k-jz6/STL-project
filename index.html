@@ -5,7 +5,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>日程表</title>
     <script src="vendor/encoding.min.js"></script>
-    <link rel="stylesheet" href="style.css">
+    <script src="vendor/xlsx.full.min.js"></script>
+    <!-- ?v= は更新のたびに変更する。ブラウザが古いファイルを使い続けるのを防ぐため -->
+    <link rel="stylesheet" href="style.css?v=20260912f">
 </head>
 <body>
     <div class="card">
@@ -25,7 +27,11 @@
             <button id="todoBtn" class="btn-secondary" type="button">ToDoリスト</button>
             <button id="downloadBtn" class="btn-secondary" type="button">💾 保存</button>
             <button id="uploadBtn" class="btn-secondary" type="button">📂 開く</button>
+            <span class="sep">|</span>
+            <button id="excelExportBtn" class="btn-secondary" type="button">📊 Excelエクスポート</button>
+            <button id="excelImportBtn" class="btn-secondary" type="button">📥 Excelインポート</button>
             <input type="file" id="fileInput" accept=".json" />
+            <input type="file" id="excelFileInput" accept=".xlsx" style="display:none;" />
         </div>
 
         <div class="top-bar">
@@ -50,15 +56,13 @@
             </div>
         </div>
 
+        <div class="main-area">
         <div id="gantt">
             <div class="gantt-scroll-container">
                 <div class="gantt-inner">
                     <div class="gantt-left">
                         <div class="left-header sticky-target">
                             <div id="rowSelectHeader" style="cursor: pointer; text-align: center; font-size: 14px; line-height: 26px;">🔲</div>
-                            <div id="lh1" contenteditable="true">項目1</div>
-                            <div id="lh2" contenteditable="true">項目2</div>
-                            <div id="lh3" contenteditable="true">時間</div>
                         </div>
                         <div id="leftRows" class="left-rows"></div>
                         <div class="left-footer-placeholder">合計</div>
@@ -72,9 +76,15 @@
             </div>
         </div>
 
-        <div class="free-memo-area">
-            <div class="free-memo-label">メモ・備考</div>
-            <textarea id="freeMemo" rows="5" placeholder="ここに自由にメモを入力できます..."></textarea>
+        <div id="memoSplitter" class="main-splitter" title="ドラッグで幅を変更（ダブルクリックで既定に戻す）"></div>
+
+        <div class="free-memo-area" id="freeMemoArea">
+            <div class="free-memo-header">
+                <button id="memoToggleBtn" class="memo-toggle-btn" type="button" aria-expanded="true" title="メモ・備考を閉じる">▶</button>
+                <span class="free-memo-label">メモ・備考</span>
+            </div>
+            <textarea id="freeMemo" placeholder="ここに自由にメモを入力できます..."></textarea>
+        </div>
         </div>
     </div>
 
@@ -163,10 +173,17 @@
         <div class="menu-item delete" id="ctxSegDelete">🗑️ 削除</div>
     </div>
 
+    <div id="headerContextMenu" class="context-menu">
+        <div class="menu-item" id="ctxHeaderAddLeft">⬅️ 左に項目列を追加</div>
+        <div class="menu-item" id="ctxHeaderAddRight">➡️ 右に項目列を追加</div>
+        <div class="menu-separator"></div>
+        <div class="menu-item delete" id="ctxHeaderDelete">🗑️ この項目列を削除</div>
+    </div>
+
     <div id="dependencyContextMenu" class="context-menu">
         <div class="menu-item delete" id="ctxDependencyDelete">🗑️ 依存線を削除</div>
     </div>
 
-    <script src="script.js"></script>
+    <script src="script.js?v=20260912f"></script>
 </body>
 </html>

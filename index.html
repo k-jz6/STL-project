@@ -3,11 +3,12 @@
 <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- セキュリティ: このフォルダ内のスクリプト・CSS以外は読み込まない／外部へ通信しない（XSS等の被害を抑える保険）。
+         外部のライブラリやCSSを追加するときは、ここも見直すこと -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'" />
     <title>日程表</title>
-    <script src="vendor/encoding.min.js"></script>
-    <script src="vendor/xlsx.full.min.js"></script>
     <!-- ?v= は更新のたびに変更する。ブラウザが古いファイルを使い続けるのを防ぐため -->
-    <link rel="stylesheet" href="style.css?v=20261004j">
+    <link rel="stylesheet" href="style.css?v=20261004o">
 </head>
 <body>
     <div class="card">
@@ -194,6 +195,6 @@
         <div class="menu-item delete" id="ctxDependencyDelete">🗑️ 依存線を削除</div>
     </div>
 
-    <script src="script.js?v=20261004j"></script>
+    <script src="script.js?v=20261004o"></script>
 </body>
 </html>

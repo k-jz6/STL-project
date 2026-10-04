@@ -158,6 +158,18 @@ const LEGACY_ITEM_COLUMN_INDEX = { "項目1": 0, "項目2": 1, "担当": 2, "時
 const DEFAULT_FREE_MEMO_HEIGHT = 116;
 const MIN_FREE_MEMO_HEIGHT = 38;
 const MAX_IMPORT_FILE_BYTES = 2 * 1024 * 1024;
+// 行の色（項目欄のみ）の選択肢。文字が読みやすい淡い色に限定する
+const ROW_COLOR_PALETTE = [
+    { value: "", name: "なし" },
+    { value: "#fee2e2", name: "赤" },
+    { value: "#ffedd5", name: "橙" },
+    { value: "#fef9c3", name: "黄" },
+    { value: "#dcfce7", name: "緑" },
+    { value: "#e0f2fe", name: "水色" },
+    { value: "#dbeafe", name: "青" },
+    { value: "#ede9fe", name: "紫" },
+    { value: "#fce7f3", name: "桃" }
+];
 const EXCEL_SHEET_PLAN = "計画";
 const EXCEL_SHEET_MEMO = "メモ";
 const EXCEL_FILE_PREFIX = "日程表：";
@@ -192,7 +204,9 @@ let appData = {
         startDate: dateToISO(defaultStart),
         endDate: dateToISO(defaultEnd),
         holidays: [],
+        vacations: [],
         showMainLine: true,
+        guideMode: "main",
         hideHolidays: false,
         memoCollapsed: false,
         memoWidth: 0
@@ -262,7 +276,7 @@ let isResizingMemo = false;
 let memoResizeStartX = 0;
 let memoResizeStartWidth = 0;
 const showHiddenCheck = document.getElementById("showHiddenCheck");
-const showMainLineCheck = document.getElementById("showMainLineCheck");
+const guideModeSelect = document.getElementById("guideModeSelect");
 const collapseAllSubsBtn = document.getElementById("collapseAllSubsBtn");
 const expandAllSubsBtn = document.getElementById("expandAllSubsBtn");
 const toggleHolidaysBtn = document.getElementById("toggleHolidaysBtn");
@@ -558,7 +572,9 @@ function createEmptyPlanData(name = "標準の計画") {
             startDate: dateToISO(defaultStart),
             endDate: dateToISO(defaultEnd),
             holidays: [],
+            vacations: [],
             showMainLine: true,
+            guideMode: "main",
             hideHolidays: false,
             memoCollapsed: false,
             memoWidth: 0
@@ -648,7 +664,9 @@ function sanitizeImportedPlanData(raw) {
             startDate,
             endDate,
             holidays: sanitizeStringArray(raw?.settings?.holidays, 366, 16),
+            vacations: sanitizeStringArray(raw?.settings?.vacations, 366, 16),
             showMainLine: raw?.settings?.showMainLine !== false,
+            guideMode: normalizeGuideMode(raw?.settings?.guideMode, raw?.settings?.showMainLine),
             hideHolidays: raw?.settings?.hideHolidays === true,
             memoCollapsed: raw?.settings?.memoCollapsed === true,
             memoWidth: Number.isFinite(Number(raw?.settings?.memoWidth)) ? Math.max(0, Number(raw.settings.memoWidth)) : 0
@@ -705,7 +723,8 @@ function sanitizeImportedPlanData(raw) {
             customHeight: Number.isFinite(Number(task?.customHeight)) ? Number(task.customHeight) : 0,
             isDone: !!task?.isDone,
             isHidden: !!task?.isHidden,
-            isSubCollapsed: !!task?.isSubCollapsed
+            isSubCollapsed: !!task?.isSubCollapsed,
+            color: normalizeRowColor(task?.color)
         };
         tasksById.set(normalizedTask.id, normalizedTask);
         return normalizedTask;
@@ -1607,7 +1626,8 @@ function syncDataModel() {
             customHeight: t.customHeight || 0,
             isDone: t.isDone || false,
             isHidden: t.isHidden || false,
-            isSubCollapsed: !!t.isSubCollapsed
+            isSubCollapsed: !!t.isSubCollapsed,
+            color: t.color || ""
         };
     });
     appData.memo = getFreeMemoText();
@@ -1666,9 +1686,13 @@ function restoreFromData(data) {
     if (typeof appData.settings.showMainLine !== "boolean") {
         appData.settings.showMainLine = true;
     }
+    appData.settings.guideMode = normalizeGuideMode(appData.settings.guideMode, appData.settings.showMainLine);
+    appData.settings.showMainLine = appData.settings.guideMode !== "off";
     if (typeof appData.settings.hideHolidays !== "boolean") {
         appData.settings.hideHolidays = false;
     }
+    if (!Array.isArray(appData.settings.holidays)) appData.settings.holidays = [];
+    if (!Array.isArray(appData.settings.vacations)) appData.settings.vacations = [];
     if (typeof appData.settings.memoCollapsed !== "boolean") {
         appData.settings.memoCollapsed = false;
     }
@@ -1709,7 +1733,7 @@ function restoreFromData(data) {
     renderLeftHeader();
 
     document.getElementById("todoColumnsInput").value = appData.todoColumns;
-    showMainLineCheck.checked = appData.settings.showMainLine !== false;
+    if (guideModeSelect) guideModeSelect.value = appData.settings.guideMode;
     updateHolidayToggleButton();
     setMemoCollapsed(appData.settings.memoCollapsed === true, { skipSave: true });
     applyMemoWidth(appData.settings.memoWidth);
@@ -1770,6 +1794,7 @@ function buildTimeline() {
             year: curr.getFullYear(),
             isWeekend: dow === 0 || dow === 6,
             isHoliday: appData.settings.holidays.includes(iso),
+            isVacation: (appData.settings.vacations || []).includes(iso),
             isToday: iso === todayISO
         });
         curr.setDate(curr.getDate() + 1);
@@ -1801,6 +1826,7 @@ function buildHeader() {
         c.className = "header-day";
         if (d.isWeekend) c.classList.add("weekend");
         if (d.isHoliday) c.classList.add("holiday");
+        if (d.isVacation) c.classList.add("vacation");
         if (d.isToday) c.classList.add("today");
         if (d.isToday && showMainLine) c.classList.add("today-boundary");
         c.innerHTML = `<div class="header-day-num">${d.month}/${d.day}</div><div class="header-day-week">${WEEKDAYS[d.dow]}</div>`;
@@ -1814,6 +1840,7 @@ function buildHeader() {
         c.className = "total-cell";
         if (d.isWeekend) c.classList.add("weekend");
         if (d.isHoliday) c.classList.add("holiday");
+        if (d.isVacation) c.classList.add("vacation");
         if (d.isToday) c.classList.add("today");
         c.dataset.iso = d.iso;
         totalRow.appendChild(c);
@@ -1839,6 +1866,7 @@ function rebuildTaskRowCells(task) {
         c.className = "cell";
         if (d.isWeekend) c.classList.add("weekend");
         if (d.isHoliday) c.classList.add("holiday");
+        if (d.isVacation) c.classList.add("vacation");
         if (d.isToday) c.classList.add("today");
         c.dataset.index = i;
         task.cellRowEl.appendChild(c);
@@ -1890,63 +1918,70 @@ function getVisibleTaskRows() {
     return taskObjects.filter(task => task.rowEl && task.rowEl.offsetParent !== null);
 }
 
+// カミナリ線の表示方法: "off"（表示しない） / "main"（メインのみ） / "mainSub"（メイン＋サブ）
+function normalizeGuideMode(mode, showMainLine) {
+    if (mode === "off" || mode === "main" || mode === "mainSub") return mode;
+    return showMainLine === false ? "off" : "main";
+}
+
+function guidePointFromElement(el, overlayRect, side) {
+    if (!el) return null;
+    const rect = el.getBoundingClientRect();
+    return {
+        x: (side === "start" ? rect.left : rect.right) - overlayRect.left,
+        y: rect.top + (rect.height / 2) - overlayRect.top
+    };
+}
+
 // 実績バーの右端（＝どこまで進んだか）の座標
 function getMainProgressEdgePoint(task, main, overlayRect) {
     const el = task.segLayerEl.querySelector(`[data-guide-role="main-progress"][data-main-id="${main.id}"]`);
-    if (!el) return null;
-    const rect = el.getBoundingClientRect();
-    return { x: rect.right - overlayRect.left, y: rect.top + (rect.height / 2) - overlayRect.top };
+    return guidePointFromElement(el, overlayRect, "end");
 }
 
 // メイン計画のバーの端の座標（side: "start" | "end"）
 function getMainBaseEdgePoint(task, main, overlayRect, side) {
     const el = task.segLayerEl.querySelector(`[data-guide-role="main-base"][data-main-id="${main.id}"]`);
-    if (!el) return null;
-    const rect = el.getBoundingClientRect();
-    return {
-        x: (side === "end" ? rect.right : rect.left) - overlayRect.left,
-        y: rect.top + (rect.height / 2) - overlayRect.top
-    };
+    return guidePointFromElement(el, overlayRect, side);
 }
 
-function getGuideAnchorPoint(task, overlayRect) {
-    // 完了にした行は、実際の進捗に関わらず完了扱いとして縦に引く
-    if (task.isDone) return null;
+// 計画の並び（同じ段に並ぶメイン計画、またはサブ計画の1段分）から、カミナリ線の折れ位置を求める。
+// getProgress(bar) は実績バー右端の座標、getBase(bar, side) は計画バー端の座標を返す。
+function computeGuideAnchor(bars, getProgress, getBase) {
+    const list = [...bars].sort((a, b) => a.startDate.localeCompare(b.startDate));
+    if (list.length === 0) return null;
 
-    const mainSchedules = [...(task.mainSchedules || [])]
-        .sort((a, b) => a.startDate.localeCompare(b.startDate));
-
-    // まだ終わっていない最初のメイン計画
-    const targetMain = mainSchedules.find(main => {
-        if (!main.progressEndDate) return true;
-        return main.progressEndDate < main.endDate;
+    // まだ終わっていない最初の計画
+    const target = list.find(bar => {
+        const end = bar.endDate || bar.startDate;
+        if (!bar.progressEndDate) return true;
+        return bar.progressEndDate < end;
     });
 
     // 実績が今日より先まで進んでいる場合だけ、その先端に合わせる。
     // 今日より手前で終わっているものは「遅れ」ではないので、縦のままにする。
-    const aheadPoint = (main) => {
-        if (!main || !main.progressEndDate || main.progressEndDate <= todayISO) return null;
-        return getMainProgressEdgePoint(task, main, overlayRect)
-            || getMainBaseEdgePoint(task, main, overlayRect, "end");
+    const aheadPoint = (bar) => {
+        if (!bar || !bar.progressEndDate || bar.progressEndDate <= todayISO) return null;
+        return getProgress(bar) || getBase(bar, "end");
     };
 
     // すべて終わっている場合は、いちばん先まで進んでいる実績の先端に合わせる
-    if (!targetMain) {
-        const furthest = mainSchedules.reduce((acc, main) =>
-            (!acc || (main.progressEndDate || "") > (acc.progressEndDate || "")) ? main : acc, null);
+    if (!target) {
+        const furthest = list.reduce((acc, bar) =>
+            (!acc || (bar.progressEndDate || "") > (acc.progressEndDate || "")) ? bar : acc, null);
         return aheadPoint(furthest);
     }
 
     // 進捗があるなら、着手時期の前後にかかわらずその先端に合わせる
-    if (targetMain.progressEndDate) {
-        const p = getMainProgressEdgePoint(task, targetMain, overlayRect);
+    if (target.progressEndDate) {
+        const p = getProgress(target);
         if (p) return p;
     }
 
     // 進捗がまだ無く、着手時期も来ていない場合。
     // 手前に今日より先まで終えた計画があれば、そこに合わせる
-    if (targetMain.startDate > todayISO) {
-        const before = mainSchedules.slice(0, mainSchedules.indexOf(targetMain));
+    if (target.startDate > todayISO) {
+        const before = list.slice(0, list.indexOf(target));
         for (let i = before.length - 1; i >= 0; i--) {
             const p = aheadPoint(before[i]);
             if (p) return p;
@@ -1954,7 +1989,41 @@ function getGuideAnchorPoint(task, overlayRect) {
         return null;
     }
 
-    return getMainBaseEdgePoint(task, targetMain, overlayRect, "start");
+    return getBase(target, "start");
+}
+
+function getGuideAnchorPoint(task, overlayRect) {
+    // 完了にした行は、実際の進捗に関わらず完了扱いとして縦に引く
+    if (task.isDone) return null;
+    return computeGuideAnchor(
+        task.mainSchedules || [],
+        (main) => getMainProgressEdgePoint(task, main, overlayRect),
+        (main, side) => getMainBaseEdgePoint(task, main, overlayRect, side)
+    );
+}
+
+// サブ計画の段ごとの折れ位置（上の段から順）。段に何もなければ x は null
+function getSubGuidePoints(task, overlayRect) {
+    if (task.isSubCollapsed) return [];
+    const rowTop = task.rowEl.getBoundingClientRect().top - overlayRect.top;
+    const lanes = new Map();
+    (task.segments || []).forEach(seg => {
+        const lane = seg._lane || 0;
+        if (!lanes.has(lane)) lanes.set(lane, []);
+        lanes.get(lane).push(seg);
+    });
+    const findEl = (seg, role) =>
+        task.segLayerEl.querySelector(`[data-guide-role="${role}"][data-seg-id="${seg.id}"]`);
+
+    return [...lanes.keys()].sort((a, b) => a - b).map(lane => {
+        const laneY = rowTop + SUB_SCHEDULE_TOP + (lane * SEGMENT_OFFSET_Y);
+        const anchor = task.isDone ? null : computeGuideAnchor(
+            lanes.get(lane),
+            (seg) => guidePointFromElement(findEl(seg, "sub-progress"), overlayRect, "end"),
+            (seg, side) => guidePointFromElement(findEl(seg, "sub-base"), overlayRect, side)
+        );
+        return { y: anchor ? anchor.y : laneY, x: anchor ? anchor.x : null };
+    });
 }
 
 function appendGuideForTask(commands, task, overlayRect, boundaryX, previousPoint, isFirstTask = false) {
@@ -1962,6 +2031,19 @@ function appendGuideForTask(commands, task, overlayRect, boundaryX, previousPoin
     const rowTop = rowRect.top - overlayRect.top;
     const rowBottom = rowRect.bottom - overlayRect.top;
     const anchorPoint = getGuideAnchorPoint(task, overlayRect);
+
+    // メイン＋サブ: メインの段、サブの各段の順に、上から折れ位置をつないでいく
+    if (normalizeGuideMode(appData.settings.guideMode, appData.settings.showMainLine) === "mainSub") {
+        const subPoints = getSubGuidePoints(task, overlayRect);
+        if (anchorPoint || subPoints.some(p => p.x !== null)) {
+            const points = [
+                anchorPoint || { x: boundaryX, y: rowTop + MAIN_LINE_Y },
+                ...subPoints.map(p => ({ x: p.x !== null ? p.x : boundaryX, y: p.y }))
+            ];
+            points.forEach(p => commands.push(`L ${p.x} ${p.y}`));
+            return points[points.length - 1];
+        }
+    }
 
     if (anchorPoint) {
         commands.push(`L ${anchorPoint.x} ${anchorPoint.y}`);
@@ -1985,7 +2067,7 @@ function renderProgressGuide() {
     overlay.innerHTML = "";
     totalOverlay.innerHTML = "";
 
-    if (appData.settings.showMainLine === false) return;
+    if (normalizeGuideMode(appData.settings.guideMode, appData.settings.showMainLine) === "off") return;
     if (!timelineDays.length) return;
 
     const visibleTasks = getVisibleTaskRows();
@@ -2362,6 +2444,7 @@ function addTaskRow(initialData = null) {
         const c = document.createElement("div"); c.className = "cell";
         if (d.isWeekend) c.classList.add("weekend");
         if (d.isHoliday) c.classList.add("holiday");
+        if (d.isVacation) c.classList.add("vacation");
         if (d.isToday) c.classList.add("today");
         c.dataset.index = i; cellRow.appendChild(c);
     }
@@ -2382,12 +2465,14 @@ function addTaskRow(initialData = null) {
         isDone: initialData ? !!initialData.isDone : false,
         isHidden: initialData ? !!initialData.isHidden : false,
         isSubCollapsed: initialData ? !!initialData.isSubCollapsed : false,
+        color: initialData ? normalizeRowColor(initialData.color) : "",
         pendingMainStartIndex: null, pendingMainStartDate: null,
         pendingStartIndex: null, pendingStartDate: null, pendingStartLane: 0,
         isSelected: false
     };
     taskObjects.push(task);
     
+    applyTaskRowColor(task);
     applyTaskSubScheduleState(task);
     renderGrip(task); 
 
@@ -2892,6 +2977,8 @@ function drawRangeSegment(task, seg, sIdx, eIdx, topPx) {
     const div = document.createElement("div");
     div.className = "segment" + (isProgressSelected ? " progress-active" : "") + (isSelected ? " segment-selected" : "");
     div.dataset.subSelectable = "true";
+    div.dataset.guideRole = "sub-base";
+    div.dataset.segId = seg.id;
     div.style.left = baseLeft + "px";
     div.style.width = baseWidth + "px";
     div.style.top = topPx + "px";
@@ -2958,6 +3045,8 @@ function drawRangeSegment(task, seg, sIdx, eIdx, topPx) {
             if (w > 0) {
                 const dDiv = document.createElement("div");
                 dDiv.className = "segment done";
+                dDiv.dataset.guideRole = "sub-progress";
+                dDiv.dataset.segId = seg.id;
                 dDiv.style.left = left + "px";
                 dDiv.style.width = w + "px";
                 dDiv.style.pointerEvents = "none";
@@ -3009,6 +3098,8 @@ function drawPointSegment(task, seg, idx, topPx) {
     const pt = document.createElement("div");
     pt.className = "point" + (isDone ? " done" : "") + (isProgressSelected ? " progress-active" : "") + (isSelected ? " segment-selected" : "");
     pt.dataset.subSelectable = "true";
+    pt.dataset.guideRole = "sub-base";
+    pt.dataset.segId = seg.id;
     pt.style.left = c + "px"; pt.style.top = topPx + "px";
     
     pt.style.cursor = "grab";
@@ -3506,6 +3597,42 @@ function handleDailyValueClick(e, task, seg, iso) {
 // ============================================
 // コンテキストメニューなど
 // ============================================
+function normalizeRowColor(value) {
+    return ROW_COLOR_PALETTE.some(c => c.value === value) ? value : "";
+}
+
+// 行の色を項目欄に反映する
+function applyTaskRowColor(task) {
+    if (!task?.leftRowEl) return;
+    const color = normalizeRowColor(task.color);
+    task.leftRowEl.classList.toggle("has-row-color", !!color);
+    if (color) task.leftRowEl.style.setProperty("--row-color", color);
+    else task.leftRowEl.style.removeProperty("--row-color");
+}
+
+// 右クリックメニュー内の色見本を描く
+function renderRowColorPalette(task) {
+    const palette = document.getElementById("cmColorPalette");
+    if (!palette) return;
+    palette.innerHTML = "";
+    ROW_COLOR_PALETTE.forEach(c => {
+        const sw = document.createElement("div");
+        sw.className = "menu-color-swatch" + ((task.color || "") === c.value ? " is-current" : "");
+        sw.title = c.name;
+        if (c.value) sw.style.background = c.value;
+        else { sw.style.background = "#fff"; sw.textContent = "×"; }
+        sw.addEventListener("click", () => {
+            const t = taskObjects.find(x => x.id === contextMenuTargetTaskId);
+            if (!t) return;
+            t.color = c.value;
+            applyTaskRowColor(t);
+            hideContextMenus();
+            triggerSave();
+        });
+        palette.appendChild(sw);
+    });
+}
+
 function showContextMenu(e, taskId) {
     contextMenuTargetTaskId = taskId;
     const task = taskObjects.find(t => t.id === taskId);
@@ -3513,12 +3640,22 @@ function showContextMenu(e, taskId) {
     const unhideBtn = document.getElementById("cmUnhide");
     if (task.isHidden) { hideBtn.style.display = "none"; unhideBtn.style.display = "block"; }
     else { hideBtn.style.display = "block"; unhideBtn.style.display = "none"; }
-    
+    renderRowColorPalette(task);
+
     segmentContextMenu.style.display = "none";
     if (headerContextMenu) headerContextMenu.style.display = "none";
     contextMenu.style.display = "block";
-    contextMenu.style.left = e.pageX + "px";
-    contextMenu.style.top = e.pageY + "px";
+    // 画面の下端・右端ではみ出さないように収める
+    const w = contextMenu.offsetWidth;
+    const h = contextMenu.offsetHeight;
+    const vw = window.innerWidth || document.documentElement.clientWidth;
+    const vh = window.innerHeight || document.documentElement.clientHeight;
+    let x = e.pageX;
+    let y = e.pageY;
+    if (vw > 0) x = Math.max(4, Math.min(x, vw - w - 4));
+    if (vh > 0) y = Math.max(4, Math.min(y, vh - h - 4));
+    contextMenu.style.left = x + "px";
+    contextMenu.style.top = y + "px";
 }
 
 function showSegmentContextMenu(e, task, seg) {
@@ -3649,8 +3786,9 @@ document.getElementById("ctxDependencyDelete").addEventListener("click", () => {
 showHiddenCheck.addEventListener("change", (e) => {
     document.body.classList.toggle("show-hidden-mode", e.target.checked);
 });
-showMainLineCheck.addEventListener("change", (e) => {
-    appData.settings.showMainLine = e.target.checked;
+guideModeSelect.addEventListener("change", (e) => {
+    appData.settings.guideMode = normalizeGuideMode(e.target.value, true);
+    appData.settings.showMainLine = appData.settings.guideMode !== "off";
     buildHeader();
     renderAllSegments();
     scheduleProgressGuideRefresh();
@@ -3860,6 +3998,7 @@ function setupControlEvents() {
         document.getElementById("settingsStartDate").value = appData.settings.startDate;
         document.getElementById("settingsEndDate").value = appData.settings.endDate;
         document.getElementById("settingsHolidays").value = appData.settings.holidays.join(", ");
+        document.getElementById("settingsVacations").value = (appData.settings.vacations || []).join(", ");
         settingsPanel.classList.remove("settings-hidden");
     });
     document.getElementById("settingsCancel").addEventListener("click", () => settingsPanel.classList.add("settings-hidden"));
@@ -3869,6 +4008,8 @@ function setupControlEvents() {
         appData.settings.endDate = document.getElementById("settingsEndDate").value;
         const hText = document.getElementById("settingsHolidays").value.trim();
         appData.settings.holidays = hText ? hText.split(",").map(s => s.trim()).filter(s => s) : [];
+        const vText = document.getElementById("settingsVacations").value.trim();
+        appData.settings.vacations = vText ? vText.split(",").map(s => s.trim()).filter(s => s) : [];
         settingsPanel.classList.add("settings-hidden");
         restoreFromData(appData); triggerSave();
     });
@@ -4911,7 +5052,7 @@ function parseExcelWorkbook(wb, fileName, basePlan = appData) {
     }
 
     // 期間: 読込先の計画の設定を引き継ぎ、読み込んだ日付を含むように広げる
-    const settings = { ...baseSettings, holidays: [...(baseSettings.holidays || [])] };
+    const settings = { ...baseSettings, holidays: [...(baseSettings.holidays || [])], vacations: [...(baseSettings.vacations || [])] };
     if (minIso && minIso < settings.startDate) {
         const d = isoToDate(minIso);
         settings.startDate = dateToISO(new Date(d.getFullYear(), d.getMonth(), 1));

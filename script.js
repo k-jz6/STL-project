@@ -1,4 +1,14 @@
 // ============================================
+// セキュリティ: クリックジャッキング対策
+// 他のページの枠(iframe)の中に読み込まれたときは画面を出さず、処理も止める
+// （サーバが無いため X-Frame-Options ヘッダの代わりにここで防ぐ）
+// ============================================
+if (window.top !== window.self) {
+    document.documentElement.style.display = "none";
+    throw new Error("日程表は他のページの枠(iframe)の中では使えません。");
+}
+
+// ============================================
 // 履歴管理 (Undo/Redo)
 // ============================================
 const HistoryManager = {
@@ -385,13 +395,38 @@ function stripEditableFormatting(el) {
     }
 }
 
-// contenteditable に装飾が入らないようにする（貼り付けはプレーンテキスト、離れるときに整形）
-function setupPlainTextEditing(el, onBlur) {
+// このページ内で始まったドラッグか（行の並べ替えや、セル内の文字の移動）
+let isInternalDrag = false;
+document.addEventListener("dragstart", () => { isInternalDrag = true; }, true);
+document.addEventListener("dragend", () => { isInternalDrag = false; }, true);
+
+// 貼り付け・外部からのドロップを、HTMLではなくプレーンテキストとして入れる
+// （他のページからHTMLを持ち込むと、画像の読込などが起きるため）
+function acceptPlainTextOnly(el) {
     el.addEventListener("paste", (e) => {
         e.preventDefault();
         const text = ((e.clipboardData || window.clipboardData)?.getData("text/plain") || "").replace(/\r?\n/g, " ");
         document.execCommand("insertText", false, text);
     });
+    el.addEventListener("drop", (e) => {
+        if (isInternalDrag) return; // ページ内のドラッグは今までどおり
+        e.preventDefault();
+        const text = (e.dataTransfer?.getData("text/plain") || "").replace(/\r?\n/g, " ");
+        if (!text) return;
+        el.focus();
+        const range = document.caretRangeFromPoint ? document.caretRangeFromPoint(e.clientX, e.clientY) : null;
+        if (range && el.contains(range.startContainer)) {
+            const sel = window.getSelection();
+            sel.removeAllRanges();
+            sel.addRange(range);
+        }
+        document.execCommand("insertText", false, text);
+    });
+}
+
+// contenteditable に装飾が入らないようにする（貼り付けはプレーンテキスト、離れるときに整形）
+function setupPlainTextEditing(el, onBlur) {
+    acceptPlainTextOnly(el);
     el.addEventListener("blur", () => {
         stripEditableFormatting(el);
         if (onBlur) onBlur();
@@ -496,10 +531,15 @@ function getByteLength(str) {
     return len;
 }
 
+// 旧形式（HTML）のメモから文字だけを取り出す。
+// 表示中の画面に innerHTML で入れると <img onerror=...> などが動くため、
+// スクリプトも画像読込も動かない別文書（DOMParser）で解析する
 function extractPlainTextFromHTML(html) {
-    const temp = document.createElement("div");
-    temp.innerHTML = html || "";
-    return temp.innerText || temp.textContent || "";
+    const doc = new DOMParser().parseFromString(String(html || ""), "text/html");
+    doc.querySelectorAll("script, style").forEach(el => el.remove());
+    doc.querySelectorAll("br").forEach(br => br.replaceWith("\n"));
+    doc.querySelectorAll("p, div, li").forEach(el => el.append("\n"));
+    return (doc.body.textContent || "").replace(/\n+$/, "");
 }
 
 function getFreeMemoText() {
@@ -859,11 +899,7 @@ function renderLeftHeader() {
         cell.textContent = text;
         cell.title = "右クリックで項目列を追加・削除できます";
 
-        cell.addEventListener("paste", (e) => {
-            e.preventDefault();
-            const text = ((e.clipboardData || window.clipboardData)?.getData("text/plain") || "").replace(/\r?\n/g, " ");
-            document.execCommand("insertText", false, text);
-        });
+        acceptPlainTextOnly(cell);
         cell.addEventListener("blur", () => {
             stripEditableFormatting(cell);
             const gridIndex = i + 1;
@@ -4653,7 +4689,7 @@ function exportTodoToCSV() {
 
 function downloadAsShiftJIS(content, filename) {
     if (typeof Encoding === "undefined") {
-        alert("文字コード変換ライブラリが読み込まれていません。インターネット接続を確認してください。\nとりあえずUTF-8(BOM付)で出力します。");
+        alert("CSVはUTF-8(BOM付)で出力します。\nExcelでそのまま開けます。");
         const blob = new Blob(["\uFEFF" + content], { type: "text/csv;charset=utf-8;" });
         const url = URL.createObjectURL(blob);
         const link = document.createElement("a");
@@ -4740,18 +4776,35 @@ function isValidIso(iso) {
     return dateToISO(isoToDate(iso)) === iso;
 }
 
+// Excelの日付シリアル値 -> YYYY-MM-DD
+// 1900年方式: 1 = 1900/1/1。Excelは実在しない 1900/2/29 を 60 として数えるため、それより前は1日ずらす
+// 1904年方式: 0 = 1904/1/1（ブックの設定 date1904）
+function excelSerialToIso(serial, date1904 = false) {
+    if (!Number.isFinite(serial)) return null;
+    let days = Math.floor(serial);
+    if (date1904) days += 1462;
+    else if (days < 60) days += 1;
+    if (days < 1) return null;
+    const d = new Date(Date.UTC(1899, 11, 30) + days * 86400000);
+    return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+
+// 日付 -> Excelの日付シリアル値（1900年方式）
+function dateToExcelSerial(date) {
+    const utc = Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
+    return Math.round((utc - Date.UTC(1899, 11, 30)) / 86400000);
+}
+
 // Excelセルの値（日付型・シリアル値・文字列）を YYYY-MM-DD に変換
-function excelCellToIso(value, settings = appData.settings) {
+function excelCellToIso(value, settings = appData.settings, date1904 = false) {
     if (value == null || value === "") return null;
     if (value instanceof Date) {
         if (Number.isNaN(value.getTime())) return null;
         return dateToISO(value);
     }
     if (typeof value === "number") {
-        const parsed = XLSX.SSF.parse_date_code(value);
-        if (!parsed) return null;
-        const iso = `${parsed.y}-${pad2(parsed.m)}-${pad2(parsed.d)}`;
-        return isValidIso(iso) ? iso : null;
+        const iso = excelSerialToIso(value, date1904);
+        return iso && isValidIso(iso) ? iso : null;
     }
     const text = String(value).trim();
     let m = text.match(/^(\d{4})[\/\-.年](\d{1,2})[\/\-.月](\d{1,2})/);
@@ -4783,7 +4836,439 @@ function planNameFromExcelFileName(fileName) {
     let name = String(fileName || "").replace(/\.xlsx$/i, "");
     name = name.replace(/^日程表[：:]/, "");
     name = name.replace(/_\d{12}$/, "");
-    return name.trim();
+    return name.trim().slice(0, 120); // JSON読込時の計画名の上限と揃える
+}
+
+// ---- .xlsx ファイルの読み書き（自作。外部ライブラリは使わない） ----
+// .xlsx は「XMLファイルをzipでまとめたもの」。このアプリで必要な範囲
+// （複数シート、文字・数値・日付、列幅）だけを、ブラウザ標準の機能で扱う。
+//   zip の圧縮・展開: CompressionStream / DecompressionStream ("deflate-raw")
+//   XML の読み取り  : DOMParser（スクリプトや外部参照は動かない）
+const XLSX_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
+const XLSX_NS_MAIN = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+const XLSX_NS_REL = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+const XLSX_NS_PKG_REL = "http://schemas.openxmlformats.org/package/2006/relationships";
+const XLSX_XML_HEAD = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n';
+// 読込時の上限（展開すると巨大になる細工ファイル対策）
+const XLSX_MAX_PART_BYTES = 30 * 1024 * 1024;   // 中の1ファイル
+const XLSX_MAX_TOTAL_BYTES = 60 * 1024 * 1024;  // 中のファイルの合計
+const XLSX_MAX_ROWS = 100000;
+const XLSX_MAX_COLS = 1000;
+
+const CRC32_TABLE = (() => {
+    const table = new Uint32Array(256);
+    for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+        table[n] = c >>> 0;
+    }
+    return table;
+})();
+
+function crc32(bytes) {
+    let c = 0xFFFFFFFF;
+    for (let i = 0; i < bytes.length; i++) c = CRC32_TABLE[(c ^ bytes[i]) & 0xFF] ^ (c >>> 8);
+    return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+// 圧縮・展開ストリームにバイト列を通す。limit を超えたら中断する
+async function pipeBytes(transform, bytes, limit = Infinity) {
+    const writer = transform.writable.getWriter();
+    writer.write(bytes).catch(() => {});
+    writer.close().catch(() => {});
+    const reader = transform.readable.getReader();
+    const chunks = [];
+    let total = 0;
+    for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.length;
+        if (total > limit) {
+            reader.cancel().catch(() => {});
+            throw new Error("Excelファイルの中身が大きすぎます。");
+        }
+        chunks.push(value);
+    }
+    const out = new Uint8Array(total);
+    let pos = 0;
+    chunks.forEach(chunk => { out.set(chunk, pos); pos += chunk.length; });
+    return out;
+}
+
+// files: [{ name, data(Uint8Array) }] -> zip の Blob
+async function createZipBlob(files, mimeType) {
+    const encoder = new TextEncoder();
+    const canDeflate = typeof CompressionStream === "function";
+    const now = new Date();
+    const dosTime = (now.getHours() << 11) | (now.getMinutes() << 5) | (now.getSeconds() >> 1);
+    const dosDate = ((now.getFullYear() - 1980) << 9) | ((now.getMonth() + 1) << 5) | now.getDate();
+    const bodies = [];
+    const centrals = [];
+    let offset = 0;
+
+    for (const file of files) {
+        const name = encoder.encode(file.name);
+        const crc = crc32(file.data);
+        const method = canDeflate ? 8 : 0;
+        const body = canDeflate ? await pipeBytes(new CompressionStream("deflate-raw"), file.data) : file.data;
+
+        const local = new Uint8Array(30 + name.length);
+        const lv = new DataView(local.buffer);
+        lv.setUint32(0, 0x04034b50, true);
+        lv.setUint16(4, 20, true);
+        lv.setUint16(6, 0x0800, true);          // ファイル名は UTF-8
+        lv.setUint16(8, method, true);
+        lv.setUint16(10, dosTime, true);
+        lv.setUint16(12, dosDate, true);
+        lv.setUint32(14, crc, true);
+        lv.setUint32(18, body.length, true);
+        lv.setUint32(22, file.data.length, true);
+        lv.setUint16(26, name.length, true);
+        local.set(name, 30);
+
+        const central = new Uint8Array(46 + name.length);
+        const cv = new DataView(central.buffer);
+        cv.setUint32(0, 0x02014b50, true);
+        cv.setUint16(4, 20, true);
+        cv.setUint16(6, 20, true);
+        cv.setUint16(8, 0x0800, true);
+        cv.setUint16(10, method, true);
+        cv.setUint16(12, dosTime, true);
+        cv.setUint16(14, dosDate, true);
+        cv.setUint32(16, crc, true);
+        cv.setUint32(20, body.length, true);
+        cv.setUint32(24, file.data.length, true);
+        cv.setUint16(28, name.length, true);
+        cv.setUint32(42, offset, true);
+        central.set(name, 46);
+
+        bodies.push(local, body);
+        centrals.push(central);
+        offset += local.length + body.length;
+    }
+
+    const centralSize = centrals.reduce((sum, c) => sum + c.length, 0);
+    const end = new Uint8Array(22);
+    const ev = new DataView(end.buffer);
+    ev.setUint32(0, 0x06054b50, true);
+    ev.setUint16(8, files.length, true);
+    ev.setUint16(10, files.length, true);
+    ev.setUint32(12, centralSize, true);
+    ev.setUint32(16, offset, true);
+    return new Blob([...bodies, ...centrals, end], { type: mimeType });
+}
+
+// zip の目次を読む -> Map(ファイル名 -> 位置・サイズ)
+function readZipDirectory(bytes) {
+    const broken = () => new Error("Excel(.xlsx)ファイルではないか、ファイルが壊れています。");
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    let eocd = -1;
+    for (let i = bytes.length - 22; i >= 0 && i >= bytes.length - 22 - 65535; i--) {
+        if (view.getUint32(i, true) === 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) throw broken();
+    const count = view.getUint16(eocd + 10, true);
+    let p = view.getUint32(eocd + 16, true);
+    const decoder = new TextDecoder();
+    const entries = new Map();
+    for (let n = 0; n < count; n++) {
+        if (p + 46 > bytes.length || view.getUint32(p, true) !== 0x02014b50) throw broken();
+        const nameLen = view.getUint16(p + 28, true);
+        const extraLen = view.getUint16(p + 30, true);
+        const commentLen = view.getUint16(p + 32, true);
+        entries.set(decoder.decode(bytes.subarray(p + 46, p + 46 + nameLen)), {
+            flags: view.getUint16(p + 8, true),
+            method: view.getUint16(p + 10, true),
+            compressedSize: view.getUint32(p + 20, true),
+            localOffset: view.getUint32(p + 42, true)
+        });
+        p += 46 + nameLen + extraLen + commentLen;
+    }
+    return entries;
+}
+
+// zip の中の1ファイルを取り出す
+async function readZipEntry(bytes, entry, limit) {
+    const broken = () => new Error("Excelファイルが壊れています。");
+    if (entry.flags & 1) throw new Error("パスワード付きのExcelファイルは読み込めません。");
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const lo = entry.localOffset;
+    if (lo + 30 > bytes.length || view.getUint32(lo, true) !== 0x04034b50) throw broken();
+    const start = lo + 30 + view.getUint16(lo + 26, true) + view.getUint16(lo + 28, true);
+    const end = start + entry.compressedSize;
+    if (end > bytes.length) throw broken();
+    const body = bytes.subarray(start, end);
+    if (entry.method === 0) {
+        if (body.length > limit) throw new Error("Excelファイルの中身が大きすぎます。");
+        return body;
+    }
+    if (entry.method === 8) {
+        if (typeof DecompressionStream !== "function") throw new Error("このブラウザはExcelの読込に対応していません。");
+        try {
+            return await pipeBytes(new DecompressionStream("deflate-raw"), body, limit);
+        } catch (err) {
+            if (err && /大きすぎ/.test(err.message)) throw err;
+            throw broken();
+        }
+    }
+    throw new Error("対応していない圧縮形式のExcelファイルです。");
+}
+
+// 「../」などを含む参照先を zip 内のパスに直す
+function resolveZipPath(baseDir, target) {
+    const raw = target.startsWith("/") ? target.slice(1) : baseDir + target;
+    const parts = [];
+    raw.split("/").forEach(seg => {
+        if (seg === "..") parts.pop();
+        else if (seg !== "." && seg !== "") parts.push(seg);
+    });
+    return parts.join("/");
+}
+
+function xmlChildren(node, localName) {
+    return Array.from(node.children).filter(el => el.localName === localName);
+}
+
+function xmlElements(node, localName) {
+    return Array.from(node.getElementsByTagNameNS("*", localName));
+}
+
+// Excel が文字列中の制御文字などに使う _xHHHH_ 表記を元の文字に戻す
+function decodeXlsxEscapes(text) {
+    return text.replace(/_x([0-9A-Fa-f]{4})_/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+}
+
+// <si> / <is> の文字列。書式付き文字列(<r>)はつなげ、ふりがな(<rPh>)は除く
+function xlsxRichText(node) {
+    let text = "";
+    Array.from(node.children).forEach(child => {
+        if (child.localName === "t") text += child.textContent;
+        else if (child.localName === "r") xmlChildren(child, "t").forEach(t => { text += t.textContent; });
+    });
+    return decodeXlsxEscapes(text);
+}
+
+// "AB12" -> 27
+function xlsxColumnIndex(ref) {
+    const m = /^([A-Za-z]{1,3})\d/.exec(ref || "");
+    if (!m) return -1;
+    let n = 0;
+    for (const ch of m[1].toUpperCase()) n = n * 26 + (ch.charCodeAt(0) - 64);
+    return n - 1;
+}
+
+// 27 -> "AB"
+function xlsxColumnName(index) {
+    let name = "";
+    let n = index + 1;
+    while (n > 0) {
+        const r = (n - 1) % 26;
+        name = String.fromCharCode(65 + r) + name;
+        n = Math.floor((n - 1) / 26);
+    }
+    return name;
+}
+
+// セルの値: 文字列 / 数値（日付はシリアル値のまま）/ 真偽値 / null
+function xlsxCellValue(cell, sharedStrings) {
+    const type = cell.getAttribute("t") || "n";
+    if (type === "inlineStr") {
+        const is = xmlChildren(cell, "is")[0];
+        return is ? xlsxRichText(is) : null;
+    }
+    const v = xmlChildren(cell, "v")[0];
+    if (!v) return null;
+    const text = v.textContent;
+    switch (type) {
+        case "s": {
+            const s = sharedStrings[parseInt(text, 10)];
+            return s === undefined ? null : s;
+        }
+        case "str": return decodeXlsxEscapes(text);
+        case "b": return text === "1" || text === "true";
+        case "e": return null;                 // #N/A などのエラー値は空扱い
+        case "d": return text;                 // ISO形式の日付文字列（excelCellToIso が読める）
+        default: {
+            const n = Number(text);
+            return text.trim() !== "" && Number.isFinite(n) ? n : null;
+        }
+    }
+}
+
+// シートの XML -> 行の配列（rows[行番号-1][列番号-1]。空のセルは null）
+function xlsxSheetRows(doc, sharedStrings) {
+    const rows = [];
+    const sheetData = xmlElements(doc, "sheetData")[0];
+    if (!sheetData) return rows;
+    let rowIndex = -1;
+    for (const rowEl of xmlChildren(sheetData, "row")) {
+        const r = parseInt(rowEl.getAttribute("r"), 10);
+        rowIndex = (Number.isFinite(r) && r > 0) ? r - 1 : rowIndex + 1;
+        if (rowIndex >= XLSX_MAX_ROWS) continue;   // 上限外の行は読み飛ばす
+        const cells = [];
+        let colIndex = -1;
+        for (const cell of xmlChildren(rowEl, "c")) {
+            const c = xlsxColumnIndex(cell.getAttribute("r"));
+            colIndex = c >= 0 ? c : colIndex + 1;
+            if (colIndex >= XLSX_MAX_COLS) continue;
+            const value = xlsxCellValue(cell, sharedStrings);
+            if (value !== null) cells[colIndex] = value;
+        }
+        for (let i = 0; i < cells.length; i++) if (cells[i] === undefined) cells[i] = null;
+        rows[rowIndex] = cells;
+    }
+    for (let i = 0; i < rows.length; i++) if (!rows[i]) rows[i] = [];
+    return rows;
+}
+
+// .xlsx のバイト列 -> { sheetNames, sheets: { シート名: 行の配列 }, date1904 }
+async function readXlsxWorkbook(bytes) {
+    const entries = readZipDirectory(bytes);
+    let budget = XLSX_MAX_TOTAL_BYTES;
+    const readXml = async (path) => {
+        const entry = path ? entries.get(path) : null;
+        if (!entry) return null;
+        const data = await readZipEntry(bytes, entry, Math.min(XLSX_MAX_PART_BYTES, budget));
+        budget -= data.length;
+        const doc = new DOMParser().parseFromString(new TextDecoder().decode(data), "application/xml");
+        if (doc.getElementsByTagName("parsererror").length > 0) throw new Error("Excelファイルの中身を読み取れません。");
+        return doc;
+    };
+    const relId = (el) => {
+        const attr = Array.from(el.attributes).find(a => a.localName === "id" && a.namespaceURI);
+        return attr ? attr.value : null;
+    };
+
+    // ブック本体の場所（通常は xl/workbook.xml）
+    const rootRels = await readXml("_rels/.rels");
+    const officeRel = rootRels
+        ? xmlElements(rootRels, "Relationship").find(r => /\/officeDocument$/.test(r.getAttribute("Type") || ""))
+        : null;
+    const workbookPath = officeRel ? resolveZipPath("", officeRel.getAttribute("Target") || "") : "xl/workbook.xml";
+    const workbook = await readXml(workbookPath);
+    if (!workbook) throw new Error("Excel(.xlsx)ファイルではないか、ファイルが壊れています。");
+
+    // ブックから各シート・共有文字列への参照
+    const baseDir = workbookPath.replace(/[^/]*$/, "");
+    const wbRels = await readXml(baseDir + "_rels/" + workbookPath.slice(baseDir.length) + ".rels");
+    const targets = new Map();
+    let sharedStringsPath = null;
+    if (wbRels) {
+        xmlElements(wbRels, "Relationship").forEach(r => {
+            const target = resolveZipPath(baseDir, r.getAttribute("Target") || "");
+            targets.set(r.getAttribute("Id"), target);
+            if (/\/sharedStrings$/.test(r.getAttribute("Type") || "")) sharedStringsPath = target;
+        });
+    }
+
+    const workbookPr = xmlElements(workbook, "workbookPr")[0];
+    const date1904 = !!workbookPr && /^(1|true)$/i.test(workbookPr.getAttribute("date1904") || "");
+    const sst = await readXml(sharedStringsPath);
+    const sharedStrings = sst ? xmlElements(sst, "si").map(xlsxRichText) : [];
+
+    const sheetNames = [];
+    const sheets = {};
+    for (const sheetEl of xmlElements(workbook, "sheet")) {
+        const name = sheetEl.getAttribute("name") || "";
+        const doc = await readXml(targets.get(relId(sheetEl)));
+        if (!doc || name in sheets) continue;
+        sheetNames.push(name);
+        sheets[name] = xlsxSheetRows(doc, sharedStrings);
+    }
+    return { sheetNames, sheets, date1904 };
+}
+
+// 文字列をセルに書ける形にする（Excel の _xHHHH_ 表記と XML のエスケープ）
+function encodeXlsxText(text) {
+    return String(text)
+        .replace(/_x[0-9A-Fa-f]{4}_/g, m => "_x005F_" + m.slice(1))      // 元から _xHHHH_ と書かれた文字はそのまま残す
+        .replace(/[\u0000-\u0008\u000B\u000C\u000D\u000E-\u001F￾￿]/g,
+            ch => "_x" + ch.charCodeAt(0).toString(16).toUpperCase().padStart(4, "0") + "_")
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function buildXlsxSheetXml(sheet) {
+    const rowsXml = [];
+    let maxCol = 0;
+    sheet.rows.forEach((row, r) => {
+        const cells = [];
+        (row || []).forEach((value, c) => {
+            if (value === null || value === undefined || value === "") return;
+            const ref = xlsxColumnName(c) + (r + 1);
+            if (value instanceof Date) {
+                if (Number.isNaN(value.getTime())) return;
+                cells.push(`<c r="${ref}" s="1"><v>${dateToExcelSerial(value)}</v></c>`);   // s="1": 日付の表示形式
+            } else if (typeof value === "number") {
+                if (!Number.isFinite(value)) return;
+                cells.push(`<c r="${ref}"><v>${value}</v></c>`);
+            } else if (typeof value === "boolean") {
+                cells.push(`<c r="${ref}" t="b"><v>${value ? 1 : 0}</v></c>`);
+            } else {
+                // 文字列は常に文字列として書く（"=" で始まっても数式にはならない）
+                cells.push(`<c r="${ref}" t="inlineStr"><is><t xml:space="preserve">${encodeXlsxText(value)}</t></is></c>`);
+            }
+            maxCol = Math.max(maxCol, c + 1);
+        });
+        if (cells.length > 0) rowsXml.push(`<row r="${r + 1}">${cells.join("")}</row>`);
+    });
+    const dimension = maxCol > 0 ? `A1:${xlsxColumnName(maxCol - 1)}${sheet.rows.length}` : "A1";
+    const widths = sheet.colWidths || [];
+    const cols = widths.length > 0
+        ? `<cols>${widths.map((w, i) => `<col min="${i + 1}" max="${i + 1}" width="${w + 0.75}" customWidth="1"/>`).join("")}</cols>`
+        : "";
+    return XLSX_XML_HEAD
+        + `<worksheet xmlns="${XLSX_NS_MAIN}" xmlns:r="${XLSX_NS_REL}">`
+        + `<dimension ref="${dimension}"/>${cols}<sheetData>${rowsXml.join("")}</sheetData></worksheet>`;
+}
+
+// sheets: [{ name, rows, colWidths(文字数) }] -> .xlsx の Blob
+async function writeXlsxBlob(sheets) {
+    const encoder = new TextEncoder();
+    const sheetEntries = sheets.map((sheet, i) => ({ ...sheet, id: i + 1 }));
+    const contentTypes = XLSX_XML_HEAD
+        + '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        + '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        + '<Default Extension="xml" ContentType="application/xml"/>'
+        + '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        + sheetEntries.map(s => `<Override PartName="/xl/worksheets/sheet${s.id}.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>`).join("")
+        + '<Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
+        + '</Types>';
+    const rootRels = XLSX_XML_HEAD
+        + `<Relationships xmlns="${XLSX_NS_PKG_REL}">`
+        + `<Relationship Id="rId1" Type="${XLSX_NS_REL}/officeDocument" Target="xl/workbook.xml"/>`
+        + '</Relationships>';
+    const workbook = XLSX_XML_HEAD
+        + `<workbook xmlns="${XLSX_NS_MAIN}" xmlns:r="${XLSX_NS_REL}">`
+        + '<bookViews><workbookView/></bookViews><sheets>'
+        + sheetEntries.map(s => `<sheet name="${encodeXlsxText(s.name)}" sheetId="${s.id}" r:id="rId${s.id}"/>`).join("")
+        + '</sheets></workbook>';
+    const workbookRels = XLSX_XML_HEAD
+        + `<Relationships xmlns="${XLSX_NS_PKG_REL}">`
+        + sheetEntries.map(s => `<Relationship Id="rId${s.id}" Type="${XLSX_NS_REL}/worksheet" Target="worksheets/sheet${s.id}.xml"/>`).join("")
+        + `<Relationship Id="rId${sheetEntries.length + 1}" Type="${XLSX_NS_REL}/styles" Target="styles.xml"/>`
+        + '</Relationships>';
+    // 書式: 0 = 標準、1 = 日付 (yyyy/m/d)
+    const styles = XLSX_XML_HEAD
+        + `<styleSheet xmlns="${XLSX_NS_MAIN}">`
+        + '<numFmts count="1"><numFmt numFmtId="164" formatCode="yyyy/m/d"/></numFmts>'
+        + '<fonts count="1"><font><sz val="11"/><name val="游ゴシック"/><family val="3"/><charset val="128"/></font></fonts>'
+        + '<fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills>'
+        + '<borders count="1"><border><left/><right/><top/><bottom/><diagonal/></border></borders>'
+        + '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>'
+        + '<cellXfs count="2"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>'
+        + '<xf numFmtId="164" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs>'
+        + '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        + '</styleSheet>';
+
+    const files = [
+        { name: "[Content_Types].xml", text: contentTypes },
+        { name: "_rels/.rels", text: rootRels },
+        { name: "xl/workbook.xml", text: workbook },
+        { name: "xl/_rels/workbook.xml.rels", text: workbookRels },
+        { name: "xl/styles.xml", text: styles },
+        ...sheetEntries.map(s => ({ name: `xl/worksheets/sheet${s.id}.xml`, text: buildXlsxSheetXml(s) }))
+    ];
+    return createZipBlob(files.map(f => ({ name: f.name, data: encoder.encode(f.text) })), XLSX_MIME);
 }
 
 // ---- エクスポート ----
@@ -4873,51 +5358,55 @@ function buildExcelMemoRows() {
     }));
 }
 
+// 出力するシートの一覧（シート名・行データ・列幅[文字数]）
 function buildExcelWorkbook() {
     syncDataModel();
 
     const headers = getHeaderTexts();
     const planRows = buildExcelPlanRows().map(row => row.map(v => (v === "" ? null : v)));
-    const wsPlan = XLSX.utils.aoa_to_sheet(planRows, { cellDates: true });
-    Object.keys(wsPlan).forEach(key => {
-        if (key[0] !== "!" && wsPlan[key].t === "d") wsPlan[key].z = "yyyy/m/d";
-    });
-    wsPlan["!cols"] = [
-        { wch: 4 }, { wch: 8 },
-        ...buildExcelTaskColumns(headers).map(c => ({ wch: c.kind === "memo" ? 18 : 16 })),
-        { wch: 7 }, { wch: 20 }, { wch: 12 }, { wch: 12 }, { wch: 11 }
+    return [
+        {
+            name: EXCEL_SHEET_PLAN,
+            rows: planRows,
+            colWidths: [
+                4, 8,
+                ...buildExcelTaskColumns(headers).map(c => (c.kind === "memo" ? 18 : 16)),
+                7, 20, 12, 12, 11
+            ]
+        },
+        { name: EXCEL_SHEET_MEMO, rows: buildExcelMemoRows(), colWidths: [30] }
     ];
-
-    const memoRows = buildExcelMemoRows();
-    const wsMemo = XLSX.utils.aoa_to_sheet(memoRows.length > 0 ? memoRows : [[null]]);
-    wsMemo["!cols"] = [{ wch: 30 }];
-
-    const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, wsPlan, EXCEL_SHEET_PLAN);
-    XLSX.utils.book_append_sheet(wb, wsMemo, EXCEL_SHEET_MEMO);
-    return wb;
 }
 
-function exportToExcel() {
-    if (typeof XLSX === "undefined") {
-        alert("Excel出力ライブラリ (vendor/xlsx.full.min.js) が読み込まれていません。");
+async function exportToExcel() {
+    let blob;
+    try {
+        blob = await writeXlsxBlob(buildExcelWorkbook());
+    } catch (err) {
+        alert("Excelの出力に失敗しました。\n" + (err && err.message ? err.message : ""));
         return;
     }
-    const wb = buildExcelWorkbook();
     const safeName = (appData.projectName || "schedule").replace(/[\\/:*?"<>|]/g, "_");
     // 日程表：<計画名>_YYYYMMDDHHMM.xlsx
-    XLSX.writeFile(wb, `${EXCEL_FILE_PREFIX}${safeName}_${formatTimestamp(new Date())}.xlsx`);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${EXCEL_FILE_PREFIX}${safeName}_${formatTimestamp(new Date())}.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
 // ---- インポート ----
 // ワークブック -> 計画データ（restoreFromData に渡せる形）
+// wb: readXlsxWorkbook の結果（シート名 -> 行データ）
 // basePlan: 期間・休日・列幅などを引き継ぐ元の計画データ（読込先の計画。無ければ現在の計画）
 function parseExcelWorkbook(wb, fileName, basePlan = appData) {
     const baseSettings = basePlan.settings || appData.settings;
-    const planSheet = wb.Sheets[EXCEL_SHEET_PLAN] || wb.Sheets[wb.SheetNames[0]];
-    if (!planSheet) throw new Error("「計画」シートが見つかりません。");
+    const rows = wb.sheets[EXCEL_SHEET_PLAN] || wb.sheets[wb.sheetNames[0]];
+    if (!rows) throw new Error("「計画」シートが見つかりません。");
 
-    const rows = XLSX.utils.sheet_to_json(planSheet, { header: 1, raw: true, defval: null });
     const headerRow = (rows[0] || []).map(cellText);
     const col = {};
     Object.entries(EXCEL_COL).forEach(([key, name]) => { col[key] = headerRow.indexOf(name); });
@@ -4980,8 +5469,8 @@ function parseExcelWorkbook(wb, fileName, basePlan = appData) {
         const type = cellText(readCell(row, col.type));
         if (type === "") continue;
         const comment = cellText(readCell(row, col.comment));
-        const startIso = excelCellToIso(readCell(row, col.start), baseSettings);
-        const endIso = excelCellToIso(readCell(row, col.end), baseSettings) || startIso;
+        const startIso = excelCellToIso(readCell(row, col.start), baseSettings, wb.date1904);
+        const endIso = excelCellToIso(readCell(row, col.end), baseSettings, wb.date1904) || startIso;
         const progress = readCell(row, col.progress);
 
         if (type === EXCEL_TYPE.mainAll) {
@@ -5041,9 +5530,8 @@ function parseExcelWorkbook(wb, fileName, basePlan = appData) {
 
     // メモ・備考シート
     let memo = "";
-    const memoSheet = wb.Sheets[EXCEL_SHEET_MEMO];
-    if (memoSheet) {
-        const memoRows = XLSX.utils.sheet_to_json(memoSheet, { header: 1, raw: true, defval: null });
+    const memoRows = wb.sheets[EXCEL_SHEET_MEMO];
+    if (memoRows) {
         memo = memoRows.map(row => {
             const cells = (row || []).map(v => (v == null ? "" : String(v)));
             while (cells.length > 0 && cells[cells.length - 1] === "") cells.pop();
@@ -5086,10 +5574,6 @@ function parseExcelWorkbook(wb, fileName, basePlan = appData) {
 }
 
 function importExcelFile(file) {
-    if (typeof XLSX === "undefined") {
-        alert("Excel読込ライブラリ (vendor/xlsx.full.min.js) が読み込まれていません。");
-        return;
-    }
     if (file.size > MAX_IMPORT_FILE_BYTES) {
         alert(`ファイルサイズが大きすぎます。${Math.floor(MAX_IMPORT_FILE_BYTES / (1024 * 1024))}MB 以下の Excel を読み込んでください。`);
         return;
@@ -5109,7 +5593,7 @@ function importExcelFile(file) {
 
         let parsed;
         try {
-            const wb = XLSX.read(new Uint8Array(evt.target.result), { type: "array", cellDates: false });
+            const wb = await readXlsxWorkbook(new Uint8Array(evt.target.result));
             parsed = parseExcelWorkbook(wb, file.name, basePlan);
         } catch (err) {
             alert("Excelの読込に失敗しました。\n" + (err && err.message ? err.message : ""));

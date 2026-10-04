@@ -7,7 +7,7 @@
     <script src="vendor/encoding.min.js"></script>
     <script src="vendor/xlsx.full.min.js"></script>
     <!-- ?v= は更新のたびに変更する。ブラウザが古いファイルを使い続けるのを防ぐため -->
-    <link rel="stylesheet" href="style.css?v=20260912i">
+    <link rel="stylesheet" href="style.css?v=20261004j">
 </head>
 <body>
     <div class="card">
@@ -24,7 +24,9 @@
             <input type="hidden" id="projectNameInput" value="標準の計画" />
 
             <div style="flex-grow:1"></div>
-            <button id="todoBtn" class="btn-secondary" type="button">ToDoリスト</button>
+            <!-- ToDoリストは当面使わないため無効化（ボタンを外しただけで、画面と処理は残してある）。
+                 復活させるときは次の1行を戻す:
+                 <button id="todoBtn" class="btn-secondary" type="button">ToDoリスト</button> -->
             <button id="downloadBtn" class="btn-secondary" type="button">💾 保存</button>
             <button id="uploadBtn" class="btn-secondary" type="button">📂 開く</button>
             <span class="sep">|</span>
@@ -44,7 +46,12 @@
                     <input type="checkbox" id="showHiddenCheck"> 非表示行を表示
                 </label>
                 <label class="toggle-hidden-label">
-                    <input type="checkbox" id="showMainLineCheck" checked> カミナリ線を表示
+                    カミナリ線
+                    <select id="guideModeSelect" class="guide-mode-select" title="進捗ライン（カミナリ線）の表示方法">
+                        <option value="off">表示しない</option>
+                        <option value="main">メインのみ</option>
+                        <option value="mainSub">メイン＋サブ</option>
+                    </select>
                 </label>
                 <button id="collapseAllSubsBtn" class="btn-secondary" type="button">サブ全閉</button>
                 <button id="expandAllSubsBtn" class="btn-secondary" type="button">サブ全開</button>
@@ -94,6 +101,7 @@
             <label>開始日 <input id="settingsStartDate" type="date" /></label>
             <label>終了日 <input id="settingsEndDate" type="date" /></label>
             <label>会社休日 (YYYY-MM-DD)<textarea id="settingsHolidays" placeholder="2025-01-01, 2025-12-31"></textarea></label>
+            <label>休暇 (YYYY-MM-DD)　※土日より少し濃い灰色で表示。休日非表示の対象にはなりません<textarea id="settingsVacations" placeholder="2025-08-13, 2025-08-14"></textarea></label>
             <hr style="border: none; border-top: 1px solid #eee; margin: 16px 0;">
             <button id="clearAllBtn" class="btn-secondary" type="button" style="width: 100%; color: #ef4444; border-color: #fca5a5;">✨ 新規開始 (クリア)</button>
             <div class="settings-buttons">
@@ -163,6 +171,8 @@
         <div class="menu-item" id="cmHide">👁️ 非表示</div>
         <div class="menu-item" id="cmUnhide" style="display:none;">👁️ 表示</div>
         <div class="menu-separator"></div>
+        <div class="menu-color-label">🎨 項目の色</div>
+        <div class="menu-color-palette" id="cmColorPalette"></div>
     </div>
 
     <div id="segmentContextMenu" class="context-menu">
@@ -184,6 +194,6 @@
         <div class="menu-item delete" id="ctxDependencyDelete">🗑️ 依存線を削除</div>
     </div>
 
-    <script src="script.js?v=20260912i"></script>
+    <script src="script.js?v=20261004j"></script>
 </body>
 </html>

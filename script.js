@@ -1240,6 +1240,17 @@ function isMainFullyDone(main) {
     return isoToDate(main.progressEndDate).getTime() >= isoToDate(main.endDate).getTime();
 }
 
+// 実施済み（黒塗り）の日が実際にあるか。進捗日が開始日より前なら「未実施」と同じ
+function hasActualProgress(bar) {
+    return !!bar?.progressEndDate && bar.progressEndDate >= bar.startDate;
+}
+
+// 開始日より前の進捗日（未実施に戻したときの名残）を消す。
+// 残したまま計画を前へ動かすと、古い進捗日が期間内に入って突然黒塗りになるため
+function clearStaleProgress(bar) {
+    if (bar?.progressEndDate && !hasActualProgress(bar)) bar.progressEndDate = null;
+}
+
 // 表示されている日の並びの中での位置。その日が無ければ直前の日の位置を返す
 function visibleDayIndex(days, iso) {
     const exact = days.indexOf(iso);
@@ -1994,10 +2005,10 @@ function computeGuideAnchor(bars, getProgress, getBase) {
         return bar.progressEndDate < end;
     });
 
-    // 実績が今日より先まで進んでいる場合だけ、その先端に合わせる。
-    // 今日より手前で終わっているものは「遅れ」ではないので、縦のままにする。
+    // 実績が今日まで（または今日より先まで）進んでいる場合だけ、その先端に合わせる。
+    // 昨日以前に終わっているものは「遅れ」ではないので、縦のままにする。
     const aheadPoint = (bar) => {
-        if (!bar || !bar.progressEndDate || bar.progressEndDate <= todayISO) return null;
+        if (!bar || !bar.progressEndDate || bar.progressEndDate < todayISO) return null;
         return getProgress(bar) || getBase(bar, "end");
     };
 
@@ -2700,8 +2711,8 @@ function drawMainSchedule(task, main, mainIndex = 0) {
     line.style.top = MAIN_LINE_Y + "px";
 
     // 実績があると開始日は動かせないので、サブ計画と同じく左ハンドルを作らない
-    if (main.progressEndDate) line.classList.add("fixed");
-    if (!main.progressEndDate) {
+    if (hasActualProgress(main)) line.classList.add("fixed");
+    if (!hasActualProgress(main)) {
         const lHandle = document.createElement("div");
         lHandle.className = "resize-handle left";
         lHandle.addEventListener("mousedown", (e) => initDrag(e, task, main, "resize-left", line, "main"));
@@ -3019,12 +3030,12 @@ function drawRangeSegment(task, seg, sIdx, eIdx, topPx) {
     div.style.width = baseWidth + "px";
     div.style.top = topPx + "px";
 
-    if (seg.progressEndDate) {
+    if (hasActualProgress(seg)) {
         div.classList.add("fixed");
     }
 
-    // [修正] 実績(progressEndDate)がある場合は開始日が固定されるため、左ハンドルは生成しない
-    if (!seg.progressEndDate) {
+    // [修正] 実績（黒塗りの日）がある場合は開始日が固定されるため、左ハンドルは生成しない
+    if (!hasActualProgress(seg)) {
         const lHandle = document.createElement("div"); lHandle.className = "resize-handle left";
         lHandle.addEventListener("mousedown", (e) => initDrag(e, task, seg, "resize-left", div));
         div.appendChild(lHandle);
@@ -3236,12 +3247,12 @@ function initDrag(e, task, seg, type, el, scope = "sub") {
     // [修正] 完了済み(progressEndDateあり)の場合、「blocked」という状態でドラッグを開始する。
     // 即座にreturnせず、グローバルなマウスイベントをあえて設定することで、
     // ドラッグ中のマウス操作をこの機能が「乗っ取る」形にし、裏側のセルに反応させないようにする。
-    if (scope === "sub" && type === "move" && seg.progressEndDate) {
+    if (scope === "sub" && type === "move" && hasActualProgress(seg)) {
         dragType = "blocked";
     }
 
     // メイン計画も同様に、実績が1日でもあれば全体移動と開始日の伸縮を禁止する
-    if (scope === "main" && seg.progressEndDate) {
+    if (scope === "main" && hasActualProgress(seg)) {
         if (type === "move" || type === "resize-left") {
             dragType = "blocked";
         } else if (type === "resize-right" && isMainFullyDone(seg)) {
@@ -3326,6 +3337,7 @@ function handleGlobalMouseUp(e) {
         );
 
         if (task && seg && dayDelta !== 0) {
+            if (dragState.scope !== "milestone") clearStaleProgress(seg);
             if (dragState.scope === "milestone" && dragState.type === "move") {
                 const shiftedDate = shiftDateByVisibleColumns(dragState.originalStartDate, dayDelta);
                 const main = findMainScheduleById(task, dragState.mainId);
@@ -3342,6 +3354,7 @@ function handleGlobalMouseUp(e) {
                     const refTask = taskObjects.find(t => t.id === ref.taskId);
                     const refSeg = refTask ? refTask.segments.find(s => s.id === ref.segId) : null;
                     if (!refSeg) return;
+                    clearStaleProgress(refSeg);
                     refSeg.startDate = shiftDateByVisibleColumns(ref.originalStartDate, dayDelta);
                     refSeg.endDate = shiftDateByVisibleColumns(ref.originalEndDate, dayDelta);
                     if (refSeg.dailyValues) {
@@ -3492,7 +3505,8 @@ function handleCellClick(task, index, y = SUB_SCHEDULE_TOP) {
         const targetSeg = findMainScheduleById(task, activeProgressSegmentId)
             || task.segments.find(s => s.id === activeProgressSegmentId);
         if (targetSeg) {
-            targetSeg.progressEndDate = clickedIso;
+            // 開始日より前をクリック = 未実施に戻す（進捗日を消す）
+            targetSeg.progressEndDate = clickedIso < targetSeg.startDate ? null : clickedIso;
             activeProgressSegmentId = null; 
             activeProgressTaskId = null;
             renderAllSegments(); 
@@ -4287,7 +4301,8 @@ function handleMainCellClick(task, index) {
             alert("この行にメインスケジュールがありません。");
             return;
         }
-        targetMain.progressEndDate = clickedIso;
+        // 開始日より前をクリック = 未実施に戻す（進捗日を消す）
+        targetMain.progressEndDate = clickedIso < targetMain.startDate ? null : clickedIso;
         activeProgressSegmentId = null;
         activeProgressTaskId = null;
         renderAllSegments();

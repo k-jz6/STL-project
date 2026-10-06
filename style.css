@@ -466,6 +466,20 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .cell:hover { background: #e5f0ff; }
 
 .editable { width: 100%; min-height: 24px; outline: none; font-size: 13px; }
+/* 項目1の右端のメモボタン（📝）。押すとその行のメモを開閉する */
+.memo-open-btn {
+    flex: 0 0 auto;
+    margin-left: 2px;
+    padding: 0 2px;
+    border: none;
+    background: transparent;
+    font-size: 12px;
+    line-height: 20px;
+    cursor: pointer;
+    opacity: 0.45;
+    border-radius: 4px;
+}
+.memo-open-btn:hover { opacity: 1; background: rgba(0, 0, 0, 0.06); }
 /* 空欄のときの案内文字（項目1 など）は表示しない */
 
 .segments-layer {

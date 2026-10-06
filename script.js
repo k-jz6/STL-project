@@ -2025,9 +2025,9 @@ function computeGuideAnchor(bars, getProgress, getBase) {
         if (p) return p;
     }
 
-    // 進捗がまだ無く、着手時期も来ていない場合。
-    // 手前に今日より先まで終えた計画があれば、そこに合わせる
-    if (target.startDate > todayISO) {
+    // 進捗がまだ無く、着手時期も来ていない場合（今日開始で今日の分が未実施も含む。遅れではない）。
+    // 手前に今日まで（または今日より先まで）終えた計画があれば、そこに合わせる
+    if (target.startDate >= todayISO) {
         const before = list.slice(0, list.indexOf(target));
         for (let i = before.length - 1; i >= 0; i--) {
             const p = aheadPoint(before[i]);
@@ -2442,15 +2442,28 @@ function addTaskRow(initialData = null) {
         const ed = document.createElement("div"); ed.className = "editable"; ed.contentEditable = "true"; ed.dataset.placeholder = ph;
         if (text) ed.textContent = text;
         setupPlainTextEditing(ed, triggerSave);
-        if (isFirst) {
-            const openMemo = (e) => {
-                e.stopPropagation();
-                openTaskMemo(task, task.leftRowEl, true);
-            };
-            cell.addEventListener("click", openMemo);
-            ed.addEventListener("click", openMemo);
-        }
         cell.appendChild(ed);
+        if (isFirst) {
+            // 項目1の文字のクリックは編集だけ。メモは右端の 📝 ボタンで開閉する
+            // （項目1のクリックは従来どおり行の選択などに伝えない）
+            const stop = (e) => e.stopPropagation();
+            cell.addEventListener("click", stop);
+            ed.addEventListener("click", stop);
+
+            const memoBtn = document.createElement("button");
+            memoBtn.type = "button";
+            memoBtn.className = "memo-open-btn";
+            memoBtn.textContent = "📝";
+            memoBtn.title = "メモを開く／閉じる";
+            memoBtn.addEventListener("mousedown", (e) => e.stopPropagation());
+            memoBtn.addEventListener("click", (e) => {
+                e.stopPropagation();
+                const isOpenForThisTask = memoPanelTaskId === task.id && !taskMemoPanel.classList.contains("memo-hidden");
+                if (isOpenForThisTask) closeTaskMemoPanel();
+                else openTaskMemo(task, task.leftRowEl, true);
+            });
+            cell.appendChild(memoBtn);
+        }
         return cell;
     };
     const headerNames = normalizeHeaders(appData.headers);

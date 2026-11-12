@@ -8,7 +8,7 @@
     <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'none'; object-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'" />
     <title>日程表</title>
     <!-- ?v= は更新のたびに変更する。ブラウザが古いファイルを使い続けるのを防ぐため -->
-    <link rel="stylesheet" href="style.css?v=20261006c">
+    <link rel="stylesheet" href="style.css?v=20261112l">
 </head>
 <body>
     <div class="card">
@@ -57,6 +57,9 @@
                 <button id="collapseAllSubsBtn" class="btn-secondary" type="button">サブ全閉</button>
                 <button id="expandAllSubsBtn" class="btn-secondary" type="button">サブ全開</button>
                 <button id="toggleHolidaysBtn" class="btn-secondary" type="button" aria-pressed="false">休日開閉</button>
+                <span class="sep">|</span>
+                <button id="addStickyBtn" class="btn-secondary" type="button" title="新しい付箋を作る">🗒️ 付箋＋</button>
+                <button id="toggleStickyBtn" class="btn-secondary" type="button" aria-pressed="false">🗒️ 非表示</button>
             </div>
             <div class="top-right">
                 <span id="rangeLabel"></span>
@@ -177,6 +180,15 @@
     </div>
 
     <div id="segmentContextMenu" class="context-menu">
+        <!-- メイン計画は右クリックした部品（線・開始/終了の○・マイルストーン）に合わせて項目を出し分ける -->
+        <div class="menu-item" id="ctxEditLabel" style="display:none;">✏️ 計画内容を編集</div>
+        <div class="menu-item" id="ctxEditSection" style="display:none;">✏️ この区間のコメントを編集</div>
+        <div class="menu-item" id="ctxClearSection" style="display:none;">🧹 この区間のコメントを消す</div>
+        <div class="menu-item" id="ctxEditComment" style="display:none;">✏️ コメントを編集</div>
+        <div class="menu-item" id="ctxClearComment" style="display:none;">🧹 コメントを消す</div>
+        <div class="menu-item delete" id="ctxDeleteEndDay" style="display:none;">🗑️ 終了日を消す（直前のマイルストーンを終了日にする）</div>
+        <div class="menu-item" id="ctxEditMilestone" style="display:none;">✏️ マイルストーン名を編集</div>
+        <div class="menu-item delete" id="ctxDeleteMilestone" style="display:none;">🗑️ このマイルストーンを削除</div>
         <div class="menu-item" id="ctxSegProgress">📊 進捗描画</div>
         <div class="menu-item" id="ctxMainDependency">🔗 依存線を開始</div>
         <div class="menu-item" id="ctxMainDependencyCancel" style="display:none;">✖ 依存線をキャンセル</div>
@@ -195,6 +207,9 @@
         <div class="menu-item delete" id="ctxDependencyDelete">🗑️ 依存線を削除</div>
     </div>
 
-    <script src="script.js?v=20261006c"></script>
+    <!-- 付箋（日程表やメモ・備考の上に浮かぶ） -->
+    <div id="stickyLayer" class="sticky-layer" aria-label="付箋"></div>
+
+    <script src="script.js?v=20261112l"></script>
 </body>
 </html>

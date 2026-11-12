@@ -168,6 +168,13 @@ const LEGACY_ITEM_COLUMN_INDEX = { "項目1": 0, "項目2": 1, "担当": 2, "時
 const DEFAULT_FREE_MEMO_HEIGHT = 116;
 const MIN_FREE_MEMO_HEIGHT = 38;
 const MAX_IMPORT_FILE_BYTES = 2 * 1024 * 1024;
+// 付箋
+const MAX_STICKY_NOTES = 100;
+const STICKY_MIN_W = 140;
+const STICKY_MIN_H = 62;   // 本文が1行強見える高さ
+const STICKY_DEFAULT_W = 220;
+const STICKY_DEFAULT_H = 160;
+const STICKY_MAX_TEXT = 5000;
 // 行の色（項目欄のみ）の選択肢。文字が読みやすい淡い色に限定する
 const ROW_COLOR_PALETTE = [
     { value: "", name: "なし" },
@@ -193,7 +200,7 @@ const EXCEL_COL = {
     end: "終了予定",
     progress: "進捗(1-10)"
 };
-const EXCEL_TYPE = { mainAll: "M全", mainStart: "M始", mainEnd: "M終", milestone: "M", sub: "S" };
+const EXCEL_TYPE = { mainAll: "M全", mainStart: "M始", mainEnd: "M終", milestone: "M", section: "M区", sub: "S" };
 const MAX_PLAN_TASKS = 500;
 const MAX_TASK_SEGMENTS = 300;
 const MAX_MAIN_SCHEDULES = 100;
@@ -219,8 +226,10 @@ let appData = {
         guideMode: "main",
         hideHolidays: false,
         memoCollapsed: false,
-        memoWidth: 0
+        memoWidth: 0,
+        stickyHidden: false
     },
+    stickyNotes: [],
     headers: DEFAULT_HEADERS.slice(),
     todoColumns: DEFAULT_TODO_COLUMNS,
     columnWidths: DEFAULT_COLUMN_WIDTHS.slice(),
@@ -247,6 +256,7 @@ let isCtrlSelectionMode = false;
 let activeDailyValueTarget = null;
 let suppressNextClickAfterProgressCancel = false;
 let suppressNextClickAfterMenuDismiss = false;
+let suppressClickUntil = 0;   // グループ選択を終えた直後のクリックを、別の操作として拾わないための時刻
 
 let currentTodoDate = new Date();
 let todoSelectionState = false; 
@@ -302,6 +312,9 @@ const segmentContextMenu = document.getElementById("segmentContextMenu");
 let contextMenuTargetSegId = null;
 let contextMenuTargetTaskForSeg = null;
 let contextMenuTargetSegAnchor = null;
+let contextMenuTargetSegPart = null;        // メイン計画のどこを右クリックしたか: line / start / end / single / milestone
+let contextMenuTargetMilestoneId = null;
+let contextMenuTargetSectionKey = null;     // 右クリックした区間（"start" = 最初の区間、それ以外は区間の始まりのマイルストーンID）
 
 const dependencyContextMenu = document.getElementById("dependencyContextMenu");
 let contextMenuTargetDependencyId = null;
@@ -314,6 +327,8 @@ const totalRow = document.getElementById("totalRow");
 const WEEKDAYS = ["日", "月", "火", "水", "木", "金", "土"];
 
 const taskMemoPanel = document.getElementById("taskMemoPanel");
+const stickyLayer = document.getElementById("stickyLayer");
+const toggleStickyBtn = document.getElementById("toggleStickyBtn");
 const taskMemoHeader = document.getElementById("taskMemoHeader");
 const taskMemoTitle = document.getElementById("taskMemoTitle");
 const taskMemoTextarea = document.getElementById("taskMemoTextarea");
@@ -383,14 +398,35 @@ function getTaskLabelEditables(task) {
 }
 
 function getTaskLabels(task) {
-    return getTaskLabelEditables(task).map(el => el.textContent);
+    return getTaskLabelEditables(task).map(editableToText);
 }
 
-// 貼り付けや編集で入り込んだ装飾(色・太字など)を取り除き、保存内容と同じプレーンテキストに揃える
-function stripEditableFormatting(el) {
+// 入力欄の中身を文字に直す。改行（<br> や段落）は "\n" にする。
+// 非表示の行でも同じ結果になるよう、画面の表示に頼る innerText は使わない
+function editableToText(el) {
+    let text = "";
+    const walk = (node) => {
+        node.childNodes.forEach(child => {
+            if (child.nodeType === Node.TEXT_NODE) {
+                text += child.data;
+            } else if (child.nodeName === "BR") {
+                text += "\n";
+            } else if (child.nodeType === Node.ELEMENT_NODE) {
+                if (/^(DIV|P|LI)$/.test(child.nodeName) && text !== "" && !text.endsWith("\n")) text += "\n";
+                walk(child);
+            }
+        });
+    };
+    walk(el);
+    return text.replace(/\n$/, "");   // 入力欄が末尾に足す空の改行は除く
+}
+
+// 貼り付けや編集で入り込んだ装飾(色・太字など)を取り除き、保存内容と同じプレーンテキストに揃える。
+// keepNewlines: 改行を残す（項目欄）。残さないときは従来どおり改行を詰める（見出し）
+function stripEditableFormatting(el, keepNewlines = false) {
     if (!el) return;
-    const text = el.textContent;
-    if (el.children.length > 0 || el.innerHTML !== text) {
+    const text = keepNewlines ? editableToText(el) : el.textContent;
+    if (el.children.length > 0 || el.innerHTML !== text || el.textContent !== text) {
         el.textContent = text;
     }
 }
@@ -402,16 +438,18 @@ document.addEventListener("dragend", () => { isInternalDrag = false; }, true);
 
 // 貼り付け・外部からのドロップを、HTMLではなくプレーンテキストとして入れる
 // （他のページからHTMLを持ち込むと、画像の読込などが起きるため）
-function acceptPlainTextOnly(el) {
+// multiline: 改行をそのまま入れる（項目欄）。false なら改行は空白にする（見出し）
+function acceptPlainTextOnly(el, multiline = false) {
+    const normalize = (raw) => (raw || "").replace(/\r\n?/g, "\n").replace(/\n/g, multiline ? "\n" : " ");
     el.addEventListener("paste", (e) => {
         e.preventDefault();
-        const text = ((e.clipboardData || window.clipboardData)?.getData("text/plain") || "").replace(/\r?\n/g, " ");
+        const text = normalize((e.clipboardData || window.clipboardData)?.getData("text/plain"));
         document.execCommand("insertText", false, text);
     });
     el.addEventListener("drop", (e) => {
         if (isInternalDrag) return; // ページ内のドラッグは今までどおり
         e.preventDefault();
-        const text = (e.dataTransfer?.getData("text/plain") || "").replace(/\r?\n/g, " ");
+        const text = normalize(e.dataTransfer?.getData("text/plain"));
         if (!text) return;
         el.focus();
         const range = document.caretRangeFromPoint ? document.caretRangeFromPoint(e.clientX, e.clientY) : null;
@@ -424,11 +462,16 @@ function acceptPlainTextOnly(el) {
     });
 }
 
-// contenteditable に装飾が入らないようにする（貼り付けはプレーンテキスト、離れるときに整形）
+// 項目欄の contenteditable。装飾は入れず（貼り付けはプレーンテキスト、離れるときに整形）、改行は残す
 function setupPlainTextEditing(el, onBlur) {
-    acceptPlainTextOnly(el);
+    acceptPlainTextOnly(el, true);
+    el.addEventListener("keydown", (e) => {
+        if (e.key !== "Enter" || e.isComposing || e.keyCode === 229) return;   // 日本語変換の確定の Enter は除く
+        e.preventDefault();
+        document.execCommand("insertLineBreak");
+    });
     el.addEventListener("blur", () => {
-        stripEditableFormatting(el);
+        stripEditableFormatting(el, true);
         if (onBlur) onBlur();
     });
 }
@@ -617,8 +660,10 @@ function createEmptyPlanData(name = "標準の計画") {
             guideMode: "main",
             hideHolidays: false,
             memoCollapsed: false,
-            memoWidth: 0
+            memoWidth: 0,
+            stickyHidden: false
         },
+        stickyNotes: [],
         headers: DEFAULT_HEADERS.slice(),
         todoColumns: DEFAULT_TODO_COLUMNS,
         columnWidths: DEFAULT_COLUMN_WIDTHS.slice(),
@@ -685,6 +730,24 @@ function sanitizeDependencies(dependencies, tasksById) {
         });
 }
 
+// 付箋の読込データを検査する（文字の長さ・数・位置と大きさの範囲）
+function sanitizeStickyNotes(list) {
+    if (!Array.isArray(list)) return [];
+    const num = (v, def, min, max) => {
+        const n = Number(v);
+        return Number.isFinite(n) ? Math.min(max, Math.max(min, Math.round(n))) : def;
+    };
+    return list.slice(0, MAX_STICKY_NOTES).map((n, i) => ({
+        id: sanitizeString(n?.id, `sticky_${i}`, 120),
+        date: sanitizeString(n?.date, "", 40),
+        text: sanitizeString(n?.text, "", STICKY_MAX_TEXT),
+        x: num(n?.x, 40, 0, 10000),
+        y: num(n?.y, 120, 0, 10000),
+        w: num(n?.w, STICKY_DEFAULT_W, STICKY_MIN_W, 3000),
+        h: num(n?.h, STICKY_DEFAULT_H, STICKY_MIN_H, 3000)
+    }));
+}
+
 function sanitizeImportedPlanData(raw) {
     if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
         throw new Error("計画データの形式が不正です。");
@@ -709,8 +772,10 @@ function sanitizeImportedPlanData(raw) {
             guideMode: normalizeGuideMode(raw?.settings?.guideMode, raw?.settings?.showMainLine),
             hideHolidays: raw?.settings?.hideHolidays === true,
             memoCollapsed: raw?.settings?.memoCollapsed === true,
-            memoWidth: Number.isFinite(Number(raw?.settings?.memoWidth)) ? Math.max(0, Number(raw.settings.memoWidth)) : 0
+            memoWidth: Number.isFinite(Number(raw?.settings?.memoWidth)) ? Math.max(0, Number(raw.settings.memoWidth)) : 0,
+            stickyHidden: raw?.settings?.stickyHidden === true
         },
+        stickyNotes: sanitizeStickyNotes(raw.stickyNotes),
         headers: importedHeaders,
         todoColumns: sanitizeString(raw.todoColumns, DEFAULT_TODO_COLUMNS, 500),
         columnWidths: normalizeColumnWidths(raw.columnWidths, importedHeaders.length),
@@ -731,15 +796,17 @@ function sanitizeImportedPlanData(raw) {
                 label: sanitizeString(main?.label, "メイン計画", 200),
                 startLabel: sanitizeString(main?.startLabel, "", 200),
                 endLabel: sanitizeString(main?.endLabel, "", 200),
+                sectionLabel: sanitizeString(main?.sectionLabel, "", 200),
                 progressEndDate: main?.progressEndDate ? sanitizeIsoDate(main.progressEndDate, null) : null,
                 milestones: Array.isArray(main?.milestones)
                     ? main.milestones.slice(0, 200).map((ms, msIndex) => ({
                         id: sanitizeString(ms?.id, `ms_${taskIndex}_${mainIndex}_${msIndex}`, 120),
                         date: sanitizeIsoDate(ms?.date, startDate),
-                        label: sanitizeString(ms?.label, "マイルストーン", 200)
+                        label: sanitizeString(ms?.label, "マイルストーン", 200),
+                        sectionLabel: sanitizeString(ms?.sectionLabel, "", 200)
                     }))
                     : []
-            }))
+            })).map(normalizeMainEndpointComments)
             : [];
 
         const normalizedTask = {
@@ -1184,22 +1251,24 @@ function getSubScheduleLaneFromY(y) {
 
 function normalizeMainSchedule(mainSchedule) {
     if (!mainSchedule || !mainSchedule.startDate || !mainSchedule.endDate) return null;
-    return {
+    return normalizeMainEndpointComments({
         id: mainSchedule.id || ("main_" + Date.now() + "_" + Math.random().toString(36).slice(2)),
         startDate: mainSchedule.startDate,
         endDate: mainSchedule.endDate,
         label: typeof mainSchedule.label === "string" ? mainSchedule.label : "",
         startLabel: mainSchedule.startLabel || "",
         endLabel: mainSchedule.endLabel || "",
+        sectionLabel: mainSchedule.sectionLabel || "",
         progressEndDate: mainSchedule.progressEndDate || null,
         milestones: Array.isArray(mainSchedule.milestones)
             ? mainSchedule.milestones.map(ms => ({
                 id: ms.id || ("ms_" + Date.now() + "_" + Math.random().toString(36).slice(2)),
                 date: ms.date,
-                label: ms.label || "マイルストーン"
+                label: ms.label || "マイルストーン",
+                sectionLabel: ms.sectionLabel || ""
             }))
             : []
-    };
+    });
 }
 
 function normalizeMainSchedules(taskData) {
@@ -1221,11 +1290,13 @@ function serializeMainSchedule(main) {
         label: main.label || "",
         startLabel: main.startLabel || "",
         endLabel: main.endLabel || "",
+        sectionLabel: main.sectionLabel || "",
         progressEndDate: main.progressEndDate || null,
         milestones: (main.milestones || []).map(ms => ({
             id: ms.id,
             date: ms.date,
-            label: ms.label || ""
+            label: ms.label || "",
+            sectionLabel: ms.sectionLabel || ""
         }))
     };
 }
@@ -1272,11 +1343,110 @@ function classifyMainMilestones(main, startIso, endIso) {
     return { startComment, endComment, others };
 }
 
-// 途中のコメントは端点に重ねないので、端点ぶんの日数を別に確保する
+// 1日だけのメイン計画（開始日＝終了日）か
+function isSingleDayMain(main) {
+    return !!main && main.startDate === main.endDate;
+}
+
+// コメントを「／」でつなぐ（空欄と、同じ文言の重複は除く）
+function joinComments(...texts) {
+    const parts = [];
+    texts.map(t => (t || "").trim()).filter(Boolean).forEach(t => { if (!parts.includes(t)) parts.push(t); });
+    return parts.join("／");
+}
+
+// 開始日・終了日のコメントは startLabel / endLabel の1か所だけに持つ。
+// 端点の日付に付いたマイルストーン（以前の操作やExcel取込で作られたもの）は、端点のコメントへ移す。
+// 1日だけの計画はコメントを1つ（startLabel）にまとめる。
+function normalizeMainEndpointComments(main) {
+    if (!main) return main;
+    const keep = [];
+    const orphanSections = [];   // 終了日に重なったマイルストーンの区間コメント（その先の区間は無いので手前の区間へ）
+    (Array.isArray(main.milestones) ? main.milestones : []).forEach(ms => {
+        if (ms.date === main.startDate) {
+            main.startLabel = joinComments(main.startLabel, ms.label);
+            main.sectionLabel = joinComments(main.sectionLabel, ms.sectionLabel);
+        } else if (ms.date === main.endDate) {
+            main.endLabel = joinComments(main.endLabel, ms.label);
+            orphanSections.push(ms.sectionLabel);
+        } else {
+            keep.push(ms);
+        }
+    });
+    main.milestones = keep;
+    if (orphanSections.some(Boolean)) {
+        const lastOwner = keep.reduce((a, b) => (!a || b.date > a.date ? b : a), null) || main;
+        lastOwner.sectionLabel = joinComments(lastOwner.sectionLabel, ...orphanSections);
+    }
+    // 1日だけの計画は区間が無いので、終了コメント・区間コメントもコメント1つにまとめる
+    if (isSingleDayMain(main) && (main.endLabel || main.sectionLabel)) {
+        main.startLabel = joinComments(main.startLabel, main.endLabel, main.sectionLabel);
+        main.endLabel = "";
+        main.sectionLabel = "";
+    }
+    return main;
+}
+
+// メイン計画の区間（◎と◎の間）の一覧。
+// 区間コメントは区間の始まりの点が持つ: 最初の区間はメイン計画（sectionLabel）、以降は始まりのマイルストーン（sectionLabel）
+function getMainSections(main) {
+    const points = [...(main?.milestones || [])].sort((a, b) => a.date.localeCompare(b.date));
+    const sections = [];
+    let owner = main, key = "start", from = main.startDate;
+    points.forEach(ms => {
+        sections.push({ owner, key, from, to: ms.date });
+        owner = ms; key = ms.id; from = ms.date;
+    });
+    sections.push({ owner, key, from, to: main.endDate });
+    return sections;
+}
+
+function findMainSectionAt(main, iso) {
+    const sections = getMainSections(main);
+    return [...sections].reverse().find(sec => iso >= sec.from) || sections[0];
+}
+
+function findMainSectionByKey(main, key) {
+    return getMainSections(main).find(sec => sec.key === key) || null;
+}
+
+// 区間コメントを書けるか。1日計画は区間が無く、途中にマイルストーンが無い計画は区間＝計画全体なので計画内容を使う
+// （ただし既に区間コメントがあるときは、編集・削除できるようにする）
+function canEditMainSection(main, section) {
+    if (!main || !section || isSingleDayMain(main)) return false;
+    return (main.milestones || []).length > 0 || !!section.owner.sectionLabel;
+}
+
+function formatMonthDay(iso) {
+    const d = isoToDate(iso);
+    return `${d.getMonth() + 1}/${d.getDate()}`;
+}
+
+function editMainSectionLabel(task, main, section) {
+    if (!main || !section) return;
+    const next = prompt(`区間のコメント（${formatMonthDay(section.from)}〜${formatMonthDay(section.to)}）:`, section.owner.sectionLabel || "");
+    if (next === null) return;
+    section.owner.sectionLabel = next.trim();
+    renderAllSegments();
+    triggerSave();
+}
+
+// 「終了日を消す」で新しい終了日になるマイルストーン（終了日の直前にある、未実施のもの）。
+// 途中にマイルストーンが無い、または直前のマイルストーンが実施済み（黒丸）のときは null
+function getMilestoneToBecomeEnd(main) {
+    if (!main || isSingleDayMain(main)) return null;
+    const inner = (main.milestones || []).filter(ms => ms.date > main.startDate && ms.date < main.endDate);
+    if (inner.length === 0) return null;
+    const last = inner.reduce((a, b) => (b.date > a.date ? b : a));
+    if (hasActualProgress(main) && main.progressEndDate >= last.date) return null;
+    return last;
+}
+
+// 途中のマイルストーンは端点に重ねないので、端点ぶんの日数を別に確保する。
+// 開始・終了のコメントは縮めて1日になったら1つにつなぐので、日数の制限にはしない
 function requiredMainDayCount(main, startIso = main?.startDate, endIso = main?.endDate) {
-    const { startComment, endComment, others } = classifyMainMilestones(main, startIso, endIso);
-    if (others.length === 0) return (startComment && endComment) ? 2 : 1;
-    return others.length + 2;
+    const { others } = classifyMainMilestones(main, startIso, endIso);
+    return others.length === 0 ? 1 : others.length + 2;
 }
 
 // これ以上は縮められない終了日（開始日を固定して縮める場合）
@@ -1418,7 +1588,9 @@ function beginDependencyDraft(task, main, anchor) {
 function completeDependencyDraft(task, main, anchor) {
     if (!dependencyDraft) return false;
     const targetRef = { taskId: task.id, mainId: main.id, anchor };
-    if (isSameEndpoint(dependencyDraft, targetRef)) {
+    const isSameSingleDay = isSingleDayMain(main)
+        && dependencyDraft.taskId === task.id && dependencyDraft.mainId === main.id;
+    if (isSameEndpoint(dependencyDraft, targetRef) || isSameSingleDay) {
         alert("始点と終点に同じ丸は指定できません。");
         return false;
     }
@@ -1449,12 +1621,15 @@ function getMainEndpointElements() {
     return Array.from(rowsContainer.querySelectorAll(".main-point[data-task-id][data-main-id][data-anchor]"));
 }
 
-function getMainEndpointElement(ref) {
-    return getMainEndpointElements().find(el =>
-        el.dataset.taskId === ref.taskId
+// 1日だけの計画の◎は、開始・終了の両方を兼ねる（data-single="1"）
+function isEndpointElementOf(el, ref) {
+    return el.dataset.taskId === ref.taskId
         && el.dataset.mainId === ref.mainId
-        && el.dataset.anchor === ref.anchor
-    ) || null;
+        && (el.dataset.anchor === ref.anchor || el.dataset.single === "1");
+}
+
+function getMainEndpointElement(ref) {
+    return getMainEndpointElements().find(el => isEndpointElementOf(el, ref)) || null;
 }
 
 function hasOverlappingMainSchedule(task, startIso, endIso, excludeId = null) {
@@ -1465,7 +1640,7 @@ function hasOverlappingMainSchedule(task, startIso, endIso, excludeId = null) {
 }
 
 function getTaskTitle(task) {
-    const parts = getTaskLabels(task).map(v => v.trim()).filter(Boolean);
+    const parts = getTaskLabels(task).map(v => v.replace(/\s*\n\s*/g, " ").trim()).filter(Boolean);
     if (parts.length === 0) return "メモ";
     return "メモ: " + parts.join(" / ");
 }
@@ -1529,6 +1704,13 @@ function getSelectedSubSegments() {
         });
     });
     return refs;
+}
+
+// サブ計画のグループ選択を終える（選択を外し、選択モードを抜ける）
+function endSubGroupSelection() {
+    clearSegmentSelection();
+    updateCtrlSelectionMode(false);
+    renderAllSegments();
 }
 
 function updateCtrlSelectionMode(enabled) {
@@ -1652,6 +1834,177 @@ function editDailyValue(task, seg, iso) {
 // ============================================
 // データ同期 & 保存
 // ============================================
+// ============================================
+// 付箋（日程表やメモ・備考の上に浮かぶメモ）。計画ごとに保存する
+// ============================================
+let stickyTopZ = 1;   // 触った付箋を一番手前に出すための重なり順
+
+function formatStickyDate(d) {
+    return `${d.getFullYear()}/${pad2(d.getMonth() + 1)}/${pad2(d.getDate())}(${WEEKDAYS[d.getDay()]})`;
+}
+
+function ensureStickyNotes() {
+    if (!Array.isArray(appData.stickyNotes)) appData.stickyNotes = [];
+    return appData.stickyNotes;
+}
+
+// 付箋の表示・非表示ボタンの文字（表示中は「非表示」、隠しているときは「表示」）
+function updateStickyToggleButton() {
+    if (!toggleStickyBtn) return;
+    const hidden = appData.settings?.stickyHidden === true;
+    toggleStickyBtn.textContent = hidden ? "🗒️ 表示" : "🗒️ 非表示";
+    toggleStickyBtn.title = hidden ? "付箋を表示する" : "付箋を隠す";
+    toggleStickyBtn.setAttribute("aria-pressed", String(hidden));
+}
+
+function renderStickyNotes() {
+    if (!stickyLayer) return;
+    stickyLayer.innerHTML = "";
+    stickyLayer.style.display = appData.settings?.stickyHidden === true ? "none" : "";
+    ensureStickyNotes().forEach(note => stickyLayer.appendChild(createStickyElement(note)));
+    updateStickyToggleButton();
+}
+
+function createStickyElement(note) {
+    const el = document.createElement("div");
+    el.className = "sticky-note";
+    el.dataset.id = note.id;
+    // 画面が小さくなっても見失わないよう、表示位置だけ画面内に収める（保存している位置は変えない）
+    const vw = window.innerWidth || document.documentElement.clientWidth || 1200;
+    const vh = window.innerHeight || document.documentElement.clientHeight || 800;
+    el.style.left = Math.min(note.x, Math.max(0, vw - 60)) + "px";
+    el.style.top = Math.min(note.y, Math.max(0, vh - 40)) + "px";
+    el.style.width = note.w + "px";
+    el.style.height = note.h + "px";
+    el.style.zIndex = String(stickyTopZ++);
+
+    const header = document.createElement("div");
+    header.className = "sticky-header";
+    header.title = "ドラッグで移動";
+
+    const date = document.createElement("input");
+    date.type = "text";
+    date.className = "sticky-date";
+    date.maxLength = 40;
+    date.value = note.date || "";
+    date.title = "日付（書き直せます）";
+    date.addEventListener("input", () => { note.date = date.value; triggerSave(); });
+
+    const del = document.createElement("button");
+    del.type = "button";
+    del.className = "sticky-delete";
+    del.textContent = "×";
+    del.title = "この付箋を削除";
+    del.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (!confirm("この付箋を削除しますか？")) return;
+        appData.stickyNotes = ensureStickyNotes().filter(n => n.id !== note.id);
+        renderStickyNotes();
+        triggerSave();
+    });
+
+    // つかむ場所（左端の印と、日付と×の間の空き）
+    const grip = document.createElement("span");
+    grip.className = "sticky-grip";
+    grip.textContent = "⠿";
+    const spacer = document.createElement("span");
+    spacer.className = "sticky-spacer";
+
+    header.appendChild(grip);
+    header.appendChild(date);
+    header.appendChild(spacer);
+    header.appendChild(del);
+
+    const text = document.createElement("textarea");
+    text.className = "sticky-text";
+    text.maxLength = STICKY_MAX_TEXT;
+    text.placeholder = "ここに入力";
+    text.value = note.text || "";
+    text.addEventListener("input", () => { note.text = text.value; triggerSave(); });
+
+    el.appendChild(header);
+    el.appendChild(text);
+
+    // 触ったら一番手前へ。付箋の上の操作は、下の日程表に伝えない
+    el.addEventListener("mousedown", (e) => {
+        el.style.zIndex = String(stickyTopZ++);
+        e.stopPropagation();
+    });
+    el.addEventListener("click", (e) => e.stopPropagation());
+    el.addEventListener("contextmenu", (e) => e.stopPropagation());
+
+    // 見出し部分をつかんで移動
+    header.addEventListener("mousedown", (e) => {
+        if (e.button !== 0 || e.target === date || e.target === del) return;
+        e.preventDefault();
+        const startX = e.clientX, startY = e.clientY;
+        const origLeft = parseFloat(el.style.left) || 0, origTop = parseFloat(el.style.top) || 0;
+        const onMove = (ev) => {
+            el.style.left = Math.max(0, origLeft + ev.clientX - startX) + "px";
+            el.style.top = Math.max(0, origTop + ev.clientY - startY) + "px";
+        };
+        const onUp = () => {
+            document.removeEventListener("mousemove", onMove);
+            document.removeEventListener("mouseup", onUp);
+            const x = Math.round(parseFloat(el.style.left) || 0), y = Math.round(parseFloat(el.style.top) || 0);
+            if (x !== note.x || y !== note.y) {
+                note.x = x; note.y = y;
+                triggerSave();
+            }
+        };
+        document.addEventListener("mousemove", onMove);
+        document.addEventListener("mouseup", onUp);
+    });
+
+    // 右下の角で大きさを変えたら保存する（中の文字の大きさは変えない）
+    if (typeof ResizeObserver === "function") {
+        let timer = null;
+        new ResizeObserver(() => {
+            clearTimeout(timer);
+            timer = setTimeout(() => {
+                if (!el.isConnected || el.offsetParent === null) return;
+                const w = Math.round(el.offsetWidth), h = Math.round(el.offsetHeight);
+                if (Math.abs(w - note.w) < 2 && Math.abs(h - note.h) < 2) return;
+                note.w = w; note.h = h;
+                triggerSave();
+            }, 300);
+        }).observe(el);
+    }
+    return el;
+}
+
+function addStickyNote() {
+    const notes = ensureStickyNotes();
+    if (notes.length >= MAX_STICKY_NOTES) {
+        alert(`付箋は${MAX_STICKY_NOTES}枚までです。`);
+        return;
+    }
+    // 重ならないよう、作るたびに少しずつずらす
+    const offset = (notes.length % 8) * 24;
+    const vw = window.innerWidth || document.documentElement.clientWidth || 1200;
+    const note = {
+        id: "sticky_" + Date.now() + "_" + Math.random().toString(36).slice(2),
+        date: formatStickyDate(new Date()),
+        text: "",
+        x: Math.max(16, Math.round(vw / 2 - STICKY_DEFAULT_W / 2)) + offset,
+        y: 140 + offset,
+        w: STICKY_DEFAULT_W,
+        h: STICKY_DEFAULT_H
+    };
+    notes.push(note);
+    appData.settings.stickyHidden = false;   // 隠しているときに作ったら表示する
+    renderStickyNotes();
+    triggerSave();
+    const created = stickyLayer?.querySelector(`.sticky-note[data-id="${note.id}"] .sticky-text`);
+    if (created) created.focus();
+}
+
+function toggleStickyNotes() {
+    appData.settings.stickyHidden = appData.settings.stickyHidden !== true;
+    renderStickyNotes();
+    triggerSave();
+}
+
 function syncDataModel() {
     appData.tasks = taskObjects.map(t => {
         return {
@@ -1784,6 +2137,9 @@ function restoreFromData(data) {
     updateHolidayToggleButton();
     setMemoCollapsed(appData.settings.memoCollapsed === true, { skipSave: true });
     applyMemoWidth(appData.settings.memoWidth);
+    if (!Array.isArray(appData.stickyNotes)) appData.stickyNotes = [];
+    if (typeof appData.settings.stickyHidden !== "boolean") appData.settings.stickyHidden = false;
+    renderStickyNotes();
 
     leftRowsContainer.innerHTML = "";
     rowsContainer.innerHTML = "";
@@ -2315,13 +2671,9 @@ function renderDependencies() {
     }
 
     getMainEndpointElements().forEach(el => {
-        const ref = {
-            taskId: el.dataset.taskId,
-            mainId: el.dataset.mainId,
-            anchor: el.dataset.anchor
-        };
-        el.classList.toggle("dependency-source", !!dependencyDraft && isSameEndpoint(ref, dependencyDraft));
-        el.classList.toggle("dependency-target", !!dependencyDraft && !isSameEndpoint(ref, dependencyDraft));
+        const isSource = !!dependencyDraft && isEndpointElementOf(el, dependencyDraft);
+        el.classList.toggle("dependency-source", isSource);
+        el.classList.toggle("dependency-target", !!dependencyDraft && !isSource);
     });
 }
 
@@ -2664,10 +3016,12 @@ function drawScheduleDivider(task) {
     task.segLayerEl.appendChild(divider);
 }
 
-function attachMainEndpointInteractions(pt, task, main, anchor, editHandler) {
+// part: 右クリックメニューの種類（"start" / "end" / 1日計画の◎は "single"）
+function attachMainEndpointInteractions(pt, task, main, anchor, editHandler, part = anchor) {
     pt.dataset.taskId = task.id;
     pt.dataset.mainId = main.id;
     pt.dataset.anchor = anchor;
+    if (part === "single") pt.dataset.single = "1";
     pt.addEventListener("mousedown", (e) => {
         if (dependencyDraft) {
             e.preventDefault();
@@ -2690,7 +3044,7 @@ function attachMainEndpointInteractions(pt, task, main, anchor, editHandler) {
     pt.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        showSegmentContextMenu(e, task, { id: main.id, scheduleScope: "main", anchor });
+        showMainContextMenu(e, task, main, part);
     });
 }
 
@@ -2715,8 +3069,9 @@ function drawMainSchedule(task, main, mainIndex = 0) {
     const left = Math.min(sc, ec);
     const width = Math.max(1, Math.abs(sc - ec));
 
+    const isSingle = isSingleDayMain(main);
     const line = document.createElement("div");
-    line.className = "segment main-segment" + (isProgressSelected ? " progress-active" : "");
+    line.className = "segment main-segment" + (isSingle ? " single-day" : "") + (isProgressSelected ? " progress-active" : "");
     line.dataset.guideRole = "main-base";
     line.dataset.mainId = main.id;
     line.style.left = left + "px";
@@ -2750,10 +3105,17 @@ function drawMainSchedule(task, main, mainIndex = 0) {
         if (isCtrlSelectionMode || e.ctrlKey) return;
         editMainScheduleLabel(task, main);
     });
+    // 右クリックした位置の日付から、どの区間（◎と◎の間）かを決める
+    const sectionKeyAt = (e) => {
+        if (isSingle || !timelineDays.length) return null;
+        const layerLeft = task.segLayerEl.getBoundingClientRect().left;
+        const idx = Math.max(0, Math.min(timelineDays.length - 1, Math.floor((e.clientX - layerLeft) / CELL_WIDTH)));
+        return findMainSectionAt(main, timelineDays[idx].iso).key;
+    };
     line.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        showSegmentContextMenu(e, task, { id: main.id, scheduleScope: "main" });
+        showMainContextMenu(e, task, main, isSingle ? "single" : "line", null, sectionKeyAt(e));
     });
     task.segLayerEl.appendChild(line);
 
@@ -2792,13 +3154,14 @@ function drawMainSchedule(task, main, mainIndex = 0) {
             pt.style.left = centerX(startIdx) + "px";
             pt.style.top = MAIN_LINE_Y + "px";
             pt.style.cursor = "grab";
-            attachMainEndpointInteractions(pt, task, main, "start", () => editMainEndpointLabel(task, main, "start"));
+            // 1日だけの計画は◎を1つだけ描き、開始・終了を兼ねる
+            attachMainEndpointInteractions(pt, task, main, "start", () => editMainEndpointLabel(task, main, "start"), isSingle ? "single" : "start");
             task.segLayerEl.appendChild(pt);
             drawMainEndpointLabel(task, main, "start", centerX(startIdx), main.startLabel || "", isProgressSelected);
         }
     }
 
-    if (endDate >= rangeStart && endDate <= rangeEnd) {
+    if (!isSingle && endDate >= rangeStart && endDate <= rangeEnd) {
         const endIdx = dateToIndex(main.endDate);
         if (endIdx !== -1) {
             const pt = document.createElement("div");
@@ -2816,6 +3179,7 @@ function drawMainSchedule(task, main, mainIndex = 0) {
     if (main.label) {
         const lab = document.createElement("div");
         lab.className = "segment-label main-label" + (isProgressSelected ? " progress-active" : "");
+        lab.dataset.labelKey = main.id + ":label";
         lab.textContent = main.label;
         lab.style.left = ((sc + ec) / 2) + "px";
         lab.dataset.baseTop = String(MAIN_LABEL_BASE_TOP);
@@ -2833,9 +3197,44 @@ function drawMainSchedule(task, main, mainIndex = 0) {
         lab.addEventListener("contextmenu", (e) => {
             e.preventDefault();
             e.stopPropagation();
-            showSegmentContextMenu(e, task, { id: main.id, scheduleScope: "main" });
+            showMainContextMenu(e, task, main, isSingle ? "single" : "line", null, sectionKeyAt(e));
         });
         task.segLayerEl.appendChild(lab);
+    }
+
+    // 区間のコメント（◎と◎の間の真ん中、線の下）
+    if (!isSingle) {
+        getMainSections(main).forEach(sec => {
+            const text = sec.owner.sectionLabel;
+            if (!text) return;
+            const sIdx2 = dateToVisibleIndexAtOrAfter(sec.from);
+            const eIdx2 = dateToVisibleIndexAtOrBefore(sec.to);
+            if (sIdx2 === -1 || eIdx2 === -1) return;
+            const top = MAIN_LINE_Y + 9;
+            const secLab = document.createElement("div");
+            secLab.className = "segment-label main-section-label" + (isProgressSelected ? " progress-active" : "");
+            secLab.dataset.labelKey = main.id + ":sec:" + sec.key;
+            secLab.textContent = text;
+            secLab.style.left = ((centerX(sIdx2) + centerX(eIdx2)) / 2) + "px";
+            secLab.dataset.baseTop = String(top);
+            secLab.style.top = top + "px";
+            secLab.addEventListener("click", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                if (isCtrlSelectionMode || e.ctrlKey || dependencyDraft) return;
+                editMainSectionLabel(task, main, findMainSectionByKey(main, sec.key));
+            });
+            secLab.addEventListener("dblclick", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+            });
+            secLab.addEventListener("contextmenu", (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                showMainContextMenu(e, task, main, "section", null, sec.key);
+            });
+            task.segLayerEl.appendChild(secLab);
+        });
     }
 
     const milestones = [...(main.milestones || [])].sort((a, b) => a.date.localeCompare(b.date));
@@ -2855,19 +3254,8 @@ function drawMainMilestone(task, main, milestone, index, mainLineEl = null) {
     pt.style.left = x + "px";
     pt.style.top = MAIN_LINE_Y + "px";
     pt.style.cursor = "grab";
-    // 端点に重なっているマイルストーンは端点のコメントなので、掴んだら端点ごと動かす
-    const atStart = milestone.date === main.startDate;
-    const atEnd = milestone.date === main.endDate;
     pt.addEventListener("mousedown", (e) => {
-        if (atStart && atEnd) {
-            initDrag(e, task, main, "move", mainLineEl || pt, "main");
-        } else if (atEnd) {
-            initDrag(e, task, main, "resize-right", mainLineEl || pt, "main");
-        } else if (atStart) {
-            initDrag(e, task, main, "resize-left", mainLineEl || pt, "main");
-        } else {
-            initDrag(e, task, { ...milestone, mainId: main.id }, "move", pt, "milestone");
-        }
+        initDrag(e, task, { ...milestone, mainId: main.id }, "move", pt, "milestone");
     });
     pt.addEventListener("dblclick", (e) => {
         e.preventDefault();
@@ -2877,16 +3265,13 @@ function drawMainMilestone(task, main, milestone, index, mainLineEl = null) {
     pt.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        if (confirm("このマイルストーンを削除しますか？")) {
-            main.milestones = (main.milestones || []).filter(ms => ms.id !== milestone.id);
-            renderAllSegments();
-            triggerSave();
-        }
+        showMainContextMenu(e, task, main, "milestone", milestone.id);
     });
     task.segLayerEl.appendChild(pt);
 
     const label = document.createElement("div");
     label.className = "segment-label milestone-label";
+    label.dataset.labelKey = main.id + ":ms:" + milestone.id;
     label.textContent = milestone.label || "マイルストーン";
     label.style.left = x + "px";
     label.dataset.baseTop = String(labelTop);
@@ -2909,11 +3294,7 @@ function drawMainMilestone(task, main, milestone, index, mainLineEl = null) {
     label.addEventListener("contextmenu", (e) => {
         e.preventDefault();
         e.stopPropagation();
-        if (confirm("このマイルストーンを削除しますか？")) {
-            main.milestones = (main.milestones || []).filter(ms => ms.id !== milestone.id);
-            renderAllSegments();
-            triggerSave();
-        }
+        showMainContextMenu(e, task, main, "milestone", milestone.id);
     });
     task.segLayerEl.appendChild(label);
 }
@@ -2941,12 +3322,21 @@ function handleSubLabelMouseDown(e, task, seg, dragEl) {
 
 function drawMainEndpointLabel(task, main, side, x, text, isProgressSelected = false) {
     if (!text) return;
+    // 1日だけの計画のコメントは、計画内容（◎の上）と重ならないよう◎の下に出す
+    const isSingle = isSingleDayMain(main);
+    const top = isSingle ? MAIN_LINE_Y + 9 : MAIN_LABEL_BASE_TOP;
     const label = document.createElement("div");
-    label.className = "segment-label main-endpoint-label" + (isProgressSelected ? " progress-active" : "");
+    label.className = "segment-label main-endpoint-label" + (isSingle ? " main-single-comment" : "") + (isProgressSelected ? " progress-active" : "");
+    label.dataset.labelKey = main.id + ":" + (isSingle ? "start" : side);
     label.textContent = text;
     label.style.left = x + "px";
-    label.dataset.baseTop = String(MAIN_LABEL_BASE_TOP);
-    label.style.top = MAIN_LABEL_BASE_TOP + "px";
+    label.dataset.baseTop = String(top);
+    label.style.top = top + "px";
+    label.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showMainContextMenu(e, task, main, isSingle ? "single" : side);
+    });
     label.addEventListener("dblclick", (e) => {
         e.preventDefault();
         e.stopPropagation();
@@ -2976,8 +3366,10 @@ function editMainScheduleLabel(task, main) {
 
 function editMainEndpointLabel(task, main, side) {
     if (!main) return;
-    const key = side === "start" ? "startLabel" : "endLabel";
-    const promptLabel = side === "start" ? "開始コメント" : "終了コメント";
+    // 1日だけの計画はコメントが1つ（startLabel）
+    const isSingle = isSingleDayMain(main);
+    const key = (isSingle || side === "start") ? "startLabel" : "endLabel";
+    const promptLabel = isSingle ? "コメント" : (side === "start" ? "開始コメント" : "終了コメント");
     const nextLabel = prompt(`${promptLabel}:`, main[key] || "");
     if (nextLabel === null) return;
     main[key] = nextLabel.trim();
@@ -3134,7 +3526,8 @@ function drawRangeSegment(task, seg, sIdx, eIdx, topPx) {
     if (seg.label) {
         const lab = document.createElement("div");
         const isCompletedFull = seg.progressEndDate && isoToDate(seg.progressEndDate).getTime() >= isoToDate(seg.endDate).getTime();
-        lab.className = "segment-label" + (isCompletedFull ? " done" : "") + (isProgressSelected ? " progress-active" : "") + (isSelected ? " segment-selected" : "");
+        lab.className = "segment-label sub-label" + (isCompletedFull ? " done" : "") + (isProgressSelected ? " progress-active" : "") + (isSelected ? " segment-selected" : "");
+        lab.dataset.labelKey = "sub:" + seg.id;
         lab.dataset.subSelectable = "true";
         lab.textContent = seg.label;
         lab.style.left = (sc + ec) / 2 + "px";
@@ -3184,7 +3577,8 @@ function drawPointSegment(task, seg, idx, topPx) {
 
     if (seg.label) {
         const lab = document.createElement("div");
-        lab.className = "segment-label" + (isDone ? " done" : "") + (isProgressSelected ? " progress-active" : "") + (isSelected ? " segment-selected" : "");
+        lab.className = "segment-label sub-label" + (isDone ? " done" : "") + (isProgressSelected ? " progress-active" : "") + (isSelected ? " segment-selected" : "");
+        lab.dataset.labelKey = "sub:" + seg.id;
         lab.dataset.subSelectable = "true";
         lab.textContent = seg.label;
         lab.style.left = c + "px"; 
@@ -3221,30 +3615,82 @@ function drawDraftStart(task, index = null, topPx = 30) {
     task.segLayerEl.appendChild(pt);
 }
 
+// メイン計画の段の文字（計画内容・開始/終了コメント・マイルストーン名）を置く高さ。
+// 線の上に2段、下に2段。近い段から順に使い、横に重なるときだけ次の段へ逃がす
+const MAIN_LABEL_LANES_ABOVE = [MAIN_LABEL_BASE_TOP, MAIN_LABEL_BASE_TOP - 14];
+const MAIN_LABEL_LANES_BELOW = [MAIN_LINE_Y + 9, MAIN_LINE_Y + 23];
+const MAIN_LABEL_GAP = 4;   // 横に並ぶ文字の最低限のすき間(px)
+
+// 文字を、候補の段（lanesOf(el) が返す高さの並び）のどれかに重ならないよう置く。
+// 前回の配置を task[memoryName] に覚えておき、位置も幅も変わっていない文字は前回の段に据え置く。
+// 空いている段を探すのは、動かした計画の文字と新しい文字だけ（関係ない文字が跳ねないように）
+function layoutLabelsInLanes(task, labels, lanesOf, memoryName) {
+    if (labels.length === 0) {
+        task[memoryName] = new Map();
+        return;
+    }
+    const previous = task[memoryName] || new Map();
+    const items = labels.map(el => {
+        const width = el.offsetWidth;
+        const center = parseFloat(el.style.left) || 0;
+        const lanes = lanesOf(el);
+        if (!el.title) el.title = el.textContent;   // 省略表示や重なりで読めないときはマウスを乗せると全文が出る
+        const key = el.dataset.labelKey || "";
+        const prev = key ? previous.get(key) : null;
+        const isUnchanged = !!prev && Math.abs(prev.center - center) < 0.5 && prev.width === width && lanes.includes(prev.top);
+        return { el, key, lanes, center, width, left: center - width / 2, right: center + width / 2, keepTop: isUnchanged ? prev.top : null };
+    }).sort((a, b) => a.left - b.left);
+
+    const placed = new Map();   // 段の高さ -> その段に置いた文字の [left, right]
+    const overlapOf = (top, item) => (placed.get(top) || []).reduce((sum, r) =>
+        sum + Math.max(0, Math.min(r.right, item.right + MAIN_LABEL_GAP) - Math.max(r.left, item.left - MAIN_LABEL_GAP)), 0);
+    const put = (item, top) => {
+        if (!placed.has(top)) placed.set(top, []);
+        placed.get(top).push(item);
+        item.top = top;
+    };
+
+    // 1) 変わっていない文字は前回の段のまま（前回と同じ位置関係なので、置き直す必要がない）
+    const rest = [];
+    items.forEach(item => {
+        if (item.keepTop !== null) put(item, item.keepTop);
+        else rest.push(item);
+    });
+    // 2) 動いた・新しい文字は、重ならない段があればそこへ。どこも重なるときは重なりが一番少ない段へ
+    rest.forEach(item => {
+        let top = item.lanes.find(t => overlapOf(t, item) === 0);
+        if (top === undefined) {
+            top = item.lanes.reduce((best, t) => (overlapOf(t, item) < overlapOf(best, item) ? t : best), item.lanes[0]);
+        }
+        put(item, top);
+    });
+
+    const next = new Map();
+    items.forEach(item => {
+        item.el.style.top = item.top + "px";
+        item.el.style.zIndex = "20";
+        if (item.key) next.set(item.key, { top: item.top, center: item.center, width: item.width });
+    });
+    task[memoryName] = next;
+}
+
+// メイン計画の段の文字。1日計画のコメントは◎の下を優先、それ以外は上を優先
+function layoutMainAreaLabels(task) {
+    const labels = Array.from(task.segLayerEl.querySelectorAll(".main-label, .main-endpoint-label, .milestone-label, .main-section-label"));
+    layoutLabelsInLanes(task, labels, el => (el.classList.contains("main-single-comment") || el.classList.contains("main-section-label")
+        ? [...MAIN_LABEL_LANES_BELOW, ...MAIN_LABEL_LANES_ABOVE]
+        : [...MAIN_LABEL_LANES_ABOVE, ...MAIN_LABEL_LANES_BELOW]), "mainLabelLanes");
+}
+
 function adjustLabelPositions(task) {
-    const labels = Array.from(task.segLayerEl.querySelectorAll(".segment-label:not(.milestone-label)"));
-    if (labels.length === 0) return;
+    layoutMainAreaLabels(task);
 
-    const groups = {};
-    labels.forEach(el => {
+    // サブ計画の文字は、その段の線の上に2段（重なるときだけ上の段へ）
+    const subLabels = Array.from(task.segLayerEl.querySelectorAll(".sub-label"));
+    layoutLabelsInLanes(task, subLabels, el => {
         const baseTop = parseFloat(el.dataset.baseTop);
-        const key = Math.round(baseTop);
-        if (!groups[key]) groups[key] = [];
-        groups[key].push({ el, baseTop, left: parseFloat(el.style.left) });
-    });
-
-    Object.values(groups).forEach(items => {
-        items.sort((a, b) => a.left - b.left);
-        items.forEach((item, index) => {
-            if (index % 2 === 0) {
-                item.el.style.top = item.baseTop + "px";
-                item.el.style.zIndex = "20";
-            } else {
-                item.el.style.top = (item.baseTop - 13.5) + "px";
-                item.el.style.zIndex = "30";
-            }
-        });
-    });
+        return [baseTop, baseTop - 14];
+    }, "subLabelLanes");
 }
 
 // ============================================
@@ -3336,6 +3782,13 @@ function handleGlobalMouseMove(e) {
 function handleGlobalMouseUp(e) {
     if (!dragState.isDragging) return;
 
+    // グループ選択中に、選択中のサブを（動かさずに）クリックしたら、グループ選択を終える。
+    // ドラッグで移動したあと、もう一度クリックすれば終わらせられる
+    const isGroupReclick = dragState.scope === "sub" && dragState.type === "move"
+        && isCtrlSelectionMode && !e.ctrlKey
+        && dragState.selectedSegRefs.length > 0
+        && Math.abs(e.clientX - dragState.startX) < 4;
+
     // [修正] blocked状態なら、何も計算せずにクリーンアップへ進む
     if (dragState.type !== "blocked") {
         const diffPx = e.clientX - dragState.startX;
@@ -3355,12 +3808,12 @@ function handleGlobalMouseUp(e) {
                 const shiftedDate = shiftDateByVisibleColumns(dragState.originalStartDate, dayDelta);
                 const main = findMainScheduleById(task, dragState.mainId);
                 if (main) {
-                    const clampedDate = shiftedDate < main.startDate
-                        ? main.startDate
-                        : shiftedDate > main.endDate
-                            ? main.endDate
-                            : shiftedDate;
-                    seg.date = clampedDate;
+                    // 途中のマイルストーンは端点に重ねない（開始日・終了日の内側だけ）
+                    const innerStart = shiftDateByVisibleColumns(main.startDate, 1);
+                    const innerEnd = shiftDateByVisibleColumns(main.endDate, -1);
+                    if (innerStart <= innerEnd) {
+                        seg.date = shiftedDate < innerStart ? innerStart : shiftedDate > innerEnd ? innerEnd : shiftedDate;
+                    }
                 }
             } else if (dragState.scope === "sub" && dragState.type === "move" && dragState.selectedSegRefs.length > 0) {
                 dragState.selectedSegRefs.forEach(ref => {
@@ -3444,6 +3897,8 @@ function handleGlobalMouseUp(e) {
                     }
                 }
             }
+            // 1日まで縮めたら開始・終了のコメントを1つにつなぐ
+            if (dragState.scope === "main") normalizeMainEndpointComments(seg);
             triggerSave();
         }
     }
@@ -3453,6 +3908,11 @@ function handleGlobalMouseUp(e) {
     document.removeEventListener("mousemove", handleGlobalMouseMove);
     document.removeEventListener("mouseup", handleGlobalMouseUp);
     dragState.isDragging = false; dragState.el = null;
+    if (isGroupReclick) {
+        suppressClickUntil = Date.now() + 300;
+        endSubGroupSelection();
+        return;
+    }
     renderAllSegments();
 }
 
@@ -3721,15 +4181,52 @@ function showContextMenu(e, taskId) {
     contextMenu.style.top = y + "px";
 }
 
+// メイン計画の右クリックメニュー。part は右クリックした部品（line / start / end / single / milestone）
+// 1日計画の◎から依存線を引くときは「終了」側から出る（入ってくるときは「開始」側として扱う）
+function showMainContextMenu(e, task, main, part, milestoneId = null, sectionKey = null) {
+    const anchor = part === "start" ? "start" : (part === "end" || part === "single") ? "end" : null;
+    showSegmentContextMenu(e, task, { id: main.id, scheduleScope: "main", anchor, part, milestoneId, sectionKey });
+}
+
 function showSegmentContextMenu(e, task, seg) {
     contextMenuTargetSegId = seg.id;
     contextMenuTargetTaskForSeg = task;
     segmentContextMenu.dataset.scope = seg.scheduleScope || "sub";
     contextMenuTargetSegAnchor = seg.anchor || null;
+    const isMain = segmentContextMenu.dataset.scope === "main";
+    const part = isMain ? (seg.part || "line") : null;
+    contextMenuTargetSegPart = part;
+    contextMenuTargetMilestoneId = seg.milestoneId || null;
+    contextMenuTargetSectionKey = seg.sectionKey || null;
+
+    // 右クリックした部品に合わせて、出す項目と文言を切り替える
+    const main = isMain ? findMainScheduleById(task, seg.id) : null;
+    const commentSide = part === "end" ? "end" : "start";
+    const commentName = part === "single" ? "コメント" : (part === "end" ? "終了コメント" : "開始コメント");
+    const hasComment = !!main && !!(commentSide === "end" ? main.endLabel : main.startLabel);
+    const isEndpointPart = part === "start" || part === "end" || part === "single";
+    const setItem = (id, visible, text) => {
+        const el = document.getElementById(id);
+        if (!el) return;
+        el.style.display = visible ? "flex" : "none";
+        if (text) el.textContent = text;
+    };
+    setItem("ctxEditLabel", part === "line" || part === "single");
+    setItem("ctxEditComment", isEndpointPart, `✏️ ${commentName}を編集`);
+    setItem("ctxClearComment", isEndpointPart && hasComment, `🧹 ${commentName}を消す`);
+    setItem("ctxDeleteEndDay", part === "end" && !!getMilestoneToBecomeEnd(main));
+    const section = (main && (part === "line" || part === "section") && contextMenuTargetSectionKey)
+        ? findMainSectionByKey(main, contextMenuTargetSectionKey) : null;
+    const sectionEditable = canEditMainSection(main, section);
+    setItem("ctxEditSection", sectionEditable);
+    setItem("ctxClearSection", sectionEditable && !!section.owner.sectionLabel);
+    setItem("ctxEditMilestone", part === "milestone");
+    setItem("ctxDeleteMilestone", part === "milestone");
+    setItem("ctxSegDelete", true, isMain ? "🗑️ この計画全体を削除" : "🗑️ 削除");
 
     const depBtn = document.getElementById("ctxMainDependency");
     const depCancelBtn = document.getElementById("ctxMainDependencyCancel");
-    const showDependencyControls = segmentContextMenu.dataset.scope === "main" && !!contextMenuTargetSegAnchor;
+    const showDependencyControls = isMain && isEndpointPart && !!contextMenuTargetSegAnchor;
     if (depBtn) {
         depBtn.style.display = showDependencyControls ? "flex" : "none";
         depBtn.textContent = dependencyDraft ? "🔗 依存線を引き直す" : "🔗 依存線を開始";
@@ -3794,9 +4291,79 @@ document.getElementById("ctxMainDependencyCancel").addEventListener("click", () 
     hideContextMenus();
 });
 
+function getContextMenuMain() {
+    if (!contextMenuTargetTaskForSeg || !contextMenuTargetSegId) return null;
+    return findMainScheduleById(contextMenuTargetTaskForSeg, contextMenuTargetSegId);
+}
+
+document.getElementById("ctxEditLabel").addEventListener("click", () => {
+    const main = getContextMenuMain();
+    if (main) editMainScheduleLabel(contextMenuTargetTaskForSeg, main);
+});
+document.getElementById("ctxEditComment").addEventListener("click", () => {
+    const main = getContextMenuMain();
+    if (main) editMainEndpointLabel(contextMenuTargetTaskForSeg, main, contextMenuTargetSegPart === "end" ? "end" : "start");
+});
+document.getElementById("ctxClearComment").addEventListener("click", () => {
+    const main = getContextMenuMain();
+    if (!main) return;
+    if (contextMenuTargetSegPart === "end") main.endLabel = "";
+    else main.startLabel = "";
+    renderAllSegments();
+    triggerSave();
+});
+// 終了日を消し、直前のマイルストーンを新しい終了日にする（その名前は終了コメントになる）
+document.getElementById("ctxDeleteEndDay").addEventListener("click", () => {
+    const main = getContextMenuMain();
+    const ms = getMilestoneToBecomeEnd(main);
+    if (!ms) return;
+    const md = (iso) => { const d = isoToDate(iso); return `${d.getMonth() + 1}/${d.getDate()}`; };
+    const oldEnd = md(main.endDate) + (main.endLabel ? `『${main.endLabel}』` : "");
+    const lostSection = ms.sectionLabel ? `\n（その間の区間コメント『${ms.sectionLabel}』も消えます）` : "";
+    if (!confirm(`終了日を ${md(ms.date)}『${ms.label || "マイルストーン"}』に変更し、元の終了日 ${oldEnd} を消します。${lostSection}\nよろしいですか？`)) return;
+    main.endDate = ms.date;
+    main.endLabel = ms.label || "";
+    main.milestones = main.milestones.filter(m => m.id !== ms.id);
+    renderAllSegments();
+    triggerSave();
+});
+
+document.getElementById("ctxEditSection").addEventListener("click", () => {
+    const main = getContextMenuMain();
+    const section = main && findMainSectionByKey(main, contextMenuTargetSectionKey);
+    if (section) editMainSectionLabel(contextMenuTargetTaskForSeg, main, section);
+});
+document.getElementById("ctxClearSection").addEventListener("click", () => {
+    const main = getContextMenuMain();
+    const section = main && findMainSectionByKey(main, contextMenuTargetSectionKey);
+    if (!section) return;
+    section.owner.sectionLabel = "";
+    renderAllSegments();
+    triggerSave();
+});
+
+document.getElementById("ctxEditMilestone").addEventListener("click", () => {
+    const main = getContextMenuMain();
+    const ms = main && (main.milestones || []).find(m => m.id === contextMenuTargetMilestoneId);
+    if (ms) editMilestone(contextMenuTargetTaskForSeg, main, ms);
+});
+document.getElementById("ctxDeleteMilestone").addEventListener("click", () => {
+    const main = getContextMenuMain();
+    const ms = main && (main.milestones || []).find(m => m.id === contextMenuTargetMilestoneId);
+    if (!ms) return;
+    if (!confirm(`マイルストーン「${ms.label || "マイルストーン"}」を削除しますか？`)) return;
+    // 前後の区間が1つになるので、区間コメントをつなぐ
+    const before = getMainSections(main).find(sec => sec.to === ms.date && sec.owner !== ms);
+    if (before && ms.sectionLabel) before.owner.sectionLabel = joinComments(before.owner.sectionLabel, ms.sectionLabel);
+    main.milestones = main.milestones.filter(m => m.id !== ms.id);
+    renderAllSegments();
+    triggerSave();
+});
+
 document.getElementById("ctxSegDelete").addEventListener("click", () => {
     if (contextMenuTargetTaskForSeg && contextMenuTargetSegId) {
-        if (confirm("選択の計画を削除しますか？")) {
+        const isMain = segmentContextMenu.dataset.scope === "main";
+        if (confirm(isMain ? "この計画全体（線・コメント・マイルストーン）を削除しますか？" : "選択の計画を削除しますか？")) {
             if (segmentContextMenu.dataset.scope === "main") {
                 contextMenuTargetTaskForSeg.mainSchedules = (contextMenuTargetTaskForSeg.mainSchedules || [])
                     .filter(main => main.id !== contextMenuTargetSegId);
@@ -3980,6 +4547,11 @@ function setupControlEvents() {
     }, true);
 
     document.addEventListener("click", (e) => {
+        if (Date.now() < suppressClickUntil) {
+            e.preventDefault();
+            e.stopPropagation();
+            return;
+        }
         if (suppressNextClickAfterMenuDismiss) {
             e.preventDefault();
             e.stopPropagation();
@@ -4019,6 +4591,12 @@ function setupControlEvents() {
             return;
         }
 
+        if (isCtrlSelectionMode && e.key === "Escape") {
+            e.preventDefault();
+            endSubGroupSelection();
+            return;
+        }
+
         const ref = getActiveDailyValueRef();
         if (!ref) return;
 
@@ -4055,6 +4633,9 @@ function setupControlEvents() {
     }, true);
 
     document.getElementById("undoBtn").addEventListener("click", () => HistoryManager.undo());
+    const addStickyBtn = document.getElementById("addStickyBtn");
+    if (addStickyBtn) addStickyBtn.addEventListener("click", addStickyNote);
+    if (toggleStickyBtn) toggleStickyBtn.addEventListener("click", toggleStickyNotes);
     document.getElementById("redoBtn").addEventListener("click", () => HistoryManager.redo());
 
     document.getElementById("settingsButton").addEventListener("click", () => {
@@ -4379,6 +4960,12 @@ function handleMainCellClick(task, index) {
     const main = clickedMain;
     if (!main) {
         alert("既存メイン計画の外側をクリックすると新しいメイン計画を追加できます。範囲内をクリックするとマイルストーンを追加できます。");
+        return;
+    }
+
+    // 開始日・終了日のマスは、マイルストーンではなく開始／終了コメント（1日計画はコメント）の入力
+    if (clickedIso === main.startDate || clickedIso === main.endDate) {
+        editMainEndpointLabel(task, main, clickedIso === main.startDate ? "start" : "end");
         return;
     }
 
@@ -5324,22 +5911,20 @@ function buildExcelPlanRows() {
             .forEach(main => {
                 const days = listVisibleDays(main.startDate, main.endDate);
                 const milestones = [...(main.milestones || [])].sort((a, b) => a.date.localeCompare(b.date));
-                const startMs = milestones.find(ms => ms.date === main.startDate) || null;
-                const endMs = (main.endDate !== main.startDate)
-                    ? (milestones.find(ms => ms.date === main.endDate) || null)
-                    : null;
                 scheduleRows.push([
                     EXCEL_TYPE.mainAll, main.label || "",
                     excelDate(days[0]), excelDate(days[days.length - 1]),
                     progressToScale(main.startDate, main.endDate, main.progressEndDate)
                 ]);
-                // 開始日・終了日のマイルストーンは M始/M終 として出力（無ければ端点コメント）
-                scheduleRows.push([EXCEL_TYPE.mainStart, startMs ? (startMs.label || "") : (main.startLabel || ""), "", "", null]);
-                scheduleRows.push([EXCEL_TYPE.mainEnd, endMs ? (endMs.label || "") : (main.endLabel || ""), "", "", null]);
+                // 開始・終了のコメントは M始/M終（1日計画のコメントは M始）
+                // 区間コメントは、その区間の始まりの行（M始 / M）のすぐ後ろに M区 として出力
+                scheduleRows.push([EXCEL_TYPE.mainStart, main.startLabel || "", "", "", null]);
+                if (main.sectionLabel) scheduleRows.push([EXCEL_TYPE.section, main.sectionLabel, "", "", null]);
+                scheduleRows.push([EXCEL_TYPE.mainEnd, main.endLabel || "", "", "", null]);
                 milestones
-                    .filter(ms => ms !== startMs && ms !== endMs)
                     .forEach(ms => {
                         scheduleRows.push([EXCEL_TYPE.milestone, ms.label || "", excelDate(ms.date), excelDate(ms.date), null]);
+                        if (ms.sectionLabel) scheduleRows.push([EXCEL_TYPE.section, ms.sectionLabel, "", "", null]);
                     });
             });
 
@@ -5453,6 +6038,7 @@ function parseExcelWorkbook(wb, fileName, basePlan = appData) {
     const tasks = [];
     let currentTask = null;
     let currentMain = null;
+    let sectionOwner = null;   // 次の M区（区間コメント）を受け取る点（メイン計画 または マイルストーン）
     const warnings = [];
     let minIso = null;
     let maxIso = null;
@@ -5492,6 +6078,7 @@ function parseExcelWorkbook(wb, fileName, basePlan = appData) {
             };
             tasks.push(currentTask);
             currentMain = null;
+            sectionOwner = null;
         }
 
         const type = cellText(readCell(row, col.type));
@@ -5502,6 +6089,7 @@ function parseExcelWorkbook(wb, fileName, basePlan = appData) {
         const progress = readCell(row, col.progress);
 
         if (type === EXCEL_TYPE.mainAll) {
+            sectionOwner = null;
             if (!startIso) { warnings.push(`${excelRowNo}行目: M全の開始予定が読めないため飛ばしました。`); currentMain = null; continue; }
             const sIso = startIso <= endIso ? startIso : endIso;
             const eIso = startIso <= endIso ? endIso : startIso;
@@ -5510,10 +6098,11 @@ function parseExcelWorkbook(wb, fileName, basePlan = appData) {
             currentMain = {
                 id: "main_" + Date.now() + "_" + Math.random().toString(36).slice(2) + "_" + r,
                 startDate: sIso, endDate: eIso,
-                label: comment, startLabel: "", endLabel: "",
+                label: comment, startLabel: "", endLabel: "", sectionLabel: "",
                 progressEndDate: scaleToProgressIso(sIso, eIso, progress, baseSettings),
                 milestones: []
             };
+            sectionOwner = currentMain;
             currentTask.mainSchedules.push(currentMain);
             noteDate(sIso); noteDate(eIso);
         } else if (type === EXCEL_TYPE.mainStart || type === EXCEL_TYPE.mainEnd || type === EXCEL_TYPE.milestone) {
@@ -5521,22 +6110,39 @@ function parseExcelWorkbook(wb, fileName, basePlan = appData) {
                 if (comment !== "") warnings.push(`${excelRowNo}行目: 直前にM全が無いため「${comment}」を飛ばしました。`);
                 continue;
             }
-            let msIso = null;
-            if (type === EXCEL_TYPE.mainStart) msIso = currentMain.startDate;
-            else if (type === EXCEL_TYPE.mainEnd) msIso = currentMain.endDate;
-            else msIso = startIso;
-            if (type !== EXCEL_TYPE.milestone && comment === "") continue;  // M始/M終 の空欄は「無し」
+            // M始/M終 は開始・終了のコメント（空欄は「無し」）
+            if (type === EXCEL_TYPE.mainStart || type === EXCEL_TYPE.mainEnd) {
+                if (type === EXCEL_TYPE.mainStart) sectionOwner = currentMain;
+                if (comment === "") continue;
+                const key = type === EXCEL_TYPE.mainStart ? "startLabel" : "endLabel";
+                currentMain[key] = joinComments(currentMain[key], comment);
+                continue;
+            }
+            const msIso = startIso;
+            sectionOwner = null;
             if (!msIso) { warnings.push(`${excelRowNo}行目: マイルストーンの日付が読めないため飛ばしました。`); continue; }
             if (msIso < currentMain.startDate || msIso > currentMain.endDate) {
                 warnings.push(`${excelRowNo}行目: マイルストーン「${comment}」がメイン計画の期間外のため飛ばしました。`);
                 continue;
             }
-            if (currentMain.milestones.some(ms => ms.date === msIso)) continue;
-            currentMain.milestones.push({
+            const sameDay = currentMain.milestones.find(ms => ms.date === msIso);
+            if (sameDay) { sectionOwner = sameDay; continue; }
+            const newMs = {
                 id: "ms_" + Date.now() + "_" + Math.random().toString(36).slice(2) + "_" + r,
                 date: msIso,
-                label: comment || "マイルストーン"
-            });
+                label: comment || "マイルストーン",
+                sectionLabel: ""
+            };
+            currentMain.milestones.push(newMs);
+            sectionOwner = newMs;
+        } else if (type === EXCEL_TYPE.section) {
+            // M区: 直前の M始 / M から始まる区間のコメント
+            if (comment === "") continue;
+            if (!currentMain || !sectionOwner) {
+                warnings.push(`${excelRowNo}行目: 区間の始まり（M始またはM）が直前に無いため、区間コメント「${comment}」を飛ばしました。`);
+                continue;
+            }
+            sectionOwner.sectionLabel = joinComments(sectionOwner.sectionLabel, comment);
         } else if (type === EXCEL_TYPE.sub) {
             if (!startIso) { warnings.push(`${excelRowNo}行目: Sの開始予定が読めないため飛ばしました。`); continue; }
             const sIso = startIso <= endIso ? startIso : endIso;
@@ -5554,7 +6160,10 @@ function parseExcelWorkbook(wb, fileName, basePlan = appData) {
             warnings.push(`${excelRowNo}行目: M/S「${type}」は不明な種別のため飛ばしました。`);
         }
     }
-    tasks.forEach(t => t.mainSchedules.sort((a, b) => a.startDate.localeCompare(b.startDate)));
+    tasks.forEach(t => {
+        t.mainSchedules.sort((a, b) => a.startDate.localeCompare(b.startDate));
+        t.mainSchedules.forEach(normalizeMainEndpointComments);
+    });
 
     // メモ・備考シート
     let memo = "";

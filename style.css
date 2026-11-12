@@ -466,6 +466,8 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .cell:hover { background: #e5f0ff; }
 
 .editable { width: 100%; min-height: 24px; outline: none; font-size: 13px; }
+/* 項目欄は入力した改行をそのまま表示する */
+.left-row .label-cell .editable { white-space: pre-wrap; overflow-wrap: anywhere; }
 /* 項目1の右端のメモボタン（📝）。押すとその行のメモを開閉する */
 .memo-open-btn {
     flex: 0 0 auto;
@@ -561,6 +563,8 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 .resize-handle.left { left: -16px; border-top-left-radius: 4px; border-bottom-left-radius: 4px; }
 .resize-handle.right { right: -16px; border-top-right-radius: 4px; border-bottom-right-radius: 4px; }
+/* 1日だけのメイン計画は線が見えないので、日数を延ばせる左右の取っ手をマウスを乗せたときに色で示す */
+.main-segment.single-day .resize-handle:hover { background: rgba(37, 99, 235, 0.18); }
 
 .segments-layer.no-pointer .segment,
 .segments-layer.no-pointer .resize-handle {
@@ -661,6 +665,10 @@ body.ctrl-select-mode .segment-label.segment-selected:active {
     transition: top 0.3s, left 0.3s;
     cursor: text;
 }
+/* 計画の文字は描き直すたびに段へ置き直すので、動きのアニメーションはしない（跳ねて見えるため） */
+.main-label, .main-endpoint-label, .milestone-label, .main-section-label, .sub-label { transition: none; }
+/* 重なって隠れた文字も、マウスを乗せると一番手前に出す */
+.segment-label:hover { z-index: 60 !important; }
 .segment-label.dragging {
     transition: none !important;
 }
@@ -1099,3 +1107,71 @@ body.ctrl-select-mode .segment-label.segment-selected:active {
     box-shadow: inset 0 0 0 1.5px var(--ring-color), inset 0 0 0 3px #fff, inset 0 0 0 4.5px var(--ring-color), 0 0 0 3px rgba(15, 118, 110, 0.14);
 }
 /* ===== 試行ここまで ===== */
+
+/* ===== 付箋（日程表やメモ・備考の上に浮かぶメモ） ===== */
+.sticky-layer {
+    position: fixed;
+    inset: 0;
+    pointer-events: none;   /* 付箋の無い所は下の画面を操作できる */
+    z-index: 2800;          /* メモ画面・設定画面より手前、右クリックメニューより奥 */
+}
+.sticky-note {
+    position: absolute;
+    pointer-events: auto;
+    display: flex;
+    flex-direction: column;
+    background: #fff9c4;
+    border: 1px solid #e6d77a;
+    border-radius: 2px;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+    resize: both;           /* 右下の角で大きさを変える */
+    overflow: hidden;
+    min-width: 140px;
+    min-height: 62px;   /* 本文が1行強見える高さまで縮められる */
+}
+.sticky-header {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px 4px 3px 6px;
+    background: #fff59d;
+    border-bottom: 1px solid #efe39a;
+    cursor: move;
+}
+.sticky-grip { color: #b8a640; font-size: 12px; padding: 0 2px; user-select: none; }
+.sticky-spacer { flex: 1; align-self: stretch; min-width: 12px; }
+.sticky-date {
+    flex: 0 1 9.5em;
+    min-width: 0;
+    border: none;
+    background: transparent;
+    font-family: inherit;
+    font-size: 12px;
+    color: #5b4a00;
+    padding: 2px;
+    cursor: text;
+}
+.sticky-date:focus { outline: 1px solid #d9c85a; background: rgba(255, 255, 255, 0.6); }
+.sticky-delete {
+    border: none;
+    background: transparent;
+    color: #8a7a20;
+    font-size: 15px;
+    line-height: 1;
+    padding: 0 4px;
+    cursor: pointer;
+}
+.sticky-delete:hover { color: #ef4444; }
+.sticky-text {
+    flex: 1;
+    width: 100%;
+    border: none;
+    background: transparent;
+    resize: none;
+    outline: none;
+    padding: 6px 8px;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.5;
+    color: #333;
+}
